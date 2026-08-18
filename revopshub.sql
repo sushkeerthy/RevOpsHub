@@ -1,26 +1,14 @@
--- RevOps AppScript Pipeline — v3 with Session Check-ins
--- Cardone Ventures | Team Neo | June 2026
+-- RevOps AppScript Pipeline — v3 Final (Date of Purchase fix)
+-- Cardone Ventures | Team Neo | July 2026
 --
--- Changes from previous v3:
---   1. session_checkins CTE added: joins silver_EventSessionAttendees → xref_Ticket
---      to get check-in flags per ticket for 4 sessions (June event, EventID = 1321):
---        - Registration Day 1 (SessionID 1972)
---        - Registration Day 2 (SessionID 1975)
---        - Registration Day 3 (SessionID 1978)
---        - 10X Vertical Summit (SessionID 2013)
---      NULL = did not check in, 'Yes' = checked in.
---      xref_Ticket bridges a10XEvents TicketID (bigint) → tenxhub ticket_id (varchar).
---      325/326 session records matched (99.7%). No fan-out — clean 1:1 per ticket per session.
---   2. 4 session columns added to Part 1 SELECT.
---   3. 4 session columns added to Part 2 SELECT (will be NULL for no-show resets by design).
---
--- Previous v3 changes preserved:
---   - 10X360 via FactGL (customer-level, historical)
---   - Product filter: event_type_id = 12
---   - Hotel/Flight Details: travel_details
---   - Vertical numeric CASE map with COLLATE
---   - Part 2 no-show resets full column coverage
---   - Status filter includes expired and no_show
+-- Changes from previous version:
+--   1. is_10x360 CTE → DimCustomer.First10X360PurchaseDate (refund-aware, BDF/WRTC excluded)
+--   2. [First 10X360 Purchase Date] added as new column in Part 1 and Part 2
+--   3. session_checkins CTE → name-based matching (covers all events, not just June 1321)
+--   4. [Ticket ID] added to final SELECT (Part 1 and Part 2)
+--   5. [Date of Purchase] switched from NetSuite silver_Transaction → tenxhub transactions.transaction_date
+--        (198/198 coverage on July validation, vs. 72/198 via NetSuite bridge)
+--        NetSuite CTEs (netsuite / netsuite_names) KEPT — still required for Sales Person 1/2 names
 
 WITH
 
@@ -99,31 +87,26 @@ sessions AS (
 ),
 
 -- ============================================================
--- SESSION CHECK-INS (a10XEvents — June event, EventID 1321)
--- Bridge: silver_EventSessionAttendees.TicketID (bigint)
---      → xref_Ticket.a10XEventsTicketID → xref_Ticket.TicketID (tenxhub varchar)
--- 4 sessions only: Registration Day 1/2/3 + 10X Vertical Summit
--- NULL = not checked in, 'Yes' = checked in
--- 325/326 matched via xref (99.7%); no fan-out confirmed
+-- SESSION CHECK-INS (a10XEvents — all events, name-based matching)
 -- ============================================================
 
 session_checkins AS (
     SELECT
-        x.TicketID COLLATE Latin1_General_100_BIN2_UTF8                AS ticket_id,
+        x.TicketID COLLATE Latin1_General_100_BIN2_UTF8          AS ticket_id,
         MAX(CASE WHEN (s.SessionName LIKE '%Registration Day 1%'
                     OR s.SessionName LIKE '%Day 1 Registration%')
                   AND s.SessionName NOT LIKE '%DO NOT USE%'
-                 THEN 'Yes' ELSE NULL END)                             AS [Registration Day 1],
+                 THEN 'Yes' ELSE NULL END)                        AS [Registration Day 1],
         MAX(CASE WHEN (s.SessionName LIKE '%Registration Day 2%'
                     OR s.SessionName LIKE '%Day 2 Registration%')
                   AND s.SessionName NOT LIKE '%DO NOT USE%'
-                 THEN 'Yes' ELSE NULL END)                             AS [Registration Day 2],
+                 THEN 'Yes' ELSE NULL END)                        AS [Registration Day 2],
         MAX(CASE WHEN (s.SessionName LIKE '%Registration Day 3%'
                     OR s.SessionName LIKE '%Day 3 Registration%')
                   AND s.SessionName NOT LIKE '%DO NOT USE%'
-                 THEN 'Yes' ELSE NULL END)                             AS [Registration Day 3],
+                 THEN 'Yes' ELSE NULL END)                        AS [Registration Day 3],
         MAX(CASE WHEN s.SessionName LIKE '%Vertical Summit%'
-                 THEN 'Yes' ELSE NULL END)                             AS [10X Vertical Summit]
+                 THEN 'Yes' ELSE NULL END)                        AS [10X Vertical Summit]
     FROM [a10XEvents].[dbo].[silver_EventSessionAttendees] sa
     INNER JOIN [a10XEvents].[dbo].[xref_Ticket] x
         ON  sa.TicketID  = x.a10XEventsTicketID
@@ -227,29 +210,17 @@ ryb_purchases AS (
 ),
 
 -- ============================================================
--- 10X360 (via MDM silver_Product — customer-level, historical)
--- Replaces hardcoded SourceProductID list with CVProductID lookup
--- from Profisee silver_Product. Excludes:
---   CV-000134 (x_10X360PR / X_10X360PRREV — retired products)
---   CV-000189 (Online Programs : 10X360WRTC — not in-person 10X360)
--- Coverage: 4,228 distinct customers vs 3,753 hardcoded (net +475)
--- Bad IDs removed: 1745 (pullover), 2161 (energy drink), 8 (parent item)
--- Deepak MDM mapping — July 2026
+-- 10X360 FLAG + FIRST PURCHASE DATE (via DimCustomer)
 -- ============================================================
 
 is_10x360 AS (
     SELECT DISTINCT
-        fgl.CVCustomerID COLLATE Latin1_General_100_BIN2_UTF8 AS cv_customer_id
-    FROM [DWH].[dbo].[FactGL] fgl
-    JOIN (
-        SELECT DISTINCT CVProductID
-        FROM [Profisee].[dbo].[silver_Product]
-        WHERE (ProductName LIKE '%360%' OR ProductSubCategory LIKE '%360%')
-          AND CVProductID NOT IN ('CV-000134', 'CV-000189')
-    ) dp
-        ON fgl.CVProductID COLLATE Latin1_General_100_BIN2_UTF8
-         = dp.CVProductID COLLATE Latin1_General_100_BIN2_UTF8
-    WHERE fgl.CVCustomerID IS NOT NULL
+        CVCustomerID COLLATE Latin1_General_100_BIN2_UTF8  AS cv_customer_id,
+        CASE WHEN First10X360PurchaseDate IS NOT NULL
+             THEN 'Yes' ELSE NULL END                      AS is_10x360_flag,
+        First10X360PurchaseDate                            AS first_10x360_purchase_date
+    FROM [DWH].[dbo].[DimCustomer]
+    WHERE CVCustomerID IS NOT NULL
 ),
 
 -- ============================================================
@@ -293,14 +264,29 @@ ticket_notes AS (
 ),
 
 -- ============================================================
--- NETSUITE (Date of Purchase, Sales Rep names)
+-- TICKET TRANSACTIONS — Date of Purchase (NEW — replaces NetSuite for this column)
+-- Source: tenxhub.ticket-manager.transactions.transaction_date
+-- Validated: 198/198 coverage on July tickets w/ sales_order_id (vs. 72/198 via NetSuite)
+-- Native join on sales_order_id — no cross-database bridge or COLLATE needed
+-- ============================================================
+
+ticket_transactions AS (
+    SELECT
+        tr.sales_order_id,
+        MIN(tr.transaction_date) AS date_of_purchase
+    FROM [tenxhub].[ticket-manager].[transactions] tr
+    WHERE tr.sales_order_id IS NOT NULL
+    GROUP BY tr.sales_order_id
+),
+
+-- ============================================================
+-- NETSUITE (Sales Rep names ONLY — Date of Purchase moved to ticket_transactions above)
 -- ============================================================
 
 netsuite AS (
     SELECT
         nt.TransactionDisplayName
             COLLATE Latin1_General_100_BIN2_UTF8          AS TransactionDisplayName,
-        MIN(nt.TransactionDate)                           AS date_of_purchase,
         MAX(nt.SalesRepName)
             COLLATE Latin1_General_100_BIN2_UTF8          AS SalesRepName,
         MAX(nt.SalesRep2Name)
@@ -328,7 +314,6 @@ netsuite AS (
 netsuite_names AS (
     SELECT
         ns.TransactionDisplayName,
-        ns.date_of_purchase,
         ns.TransactionID,
         CASE ns.SalesRepName
             WHEN 'Michael Leahy'       THEN 'Mike Leahy'
@@ -566,7 +551,7 @@ SELECT
     a.attendee_phone                                            AS [Phone Number],
     t.purchaser_email                                           AS [Customer Email],
     c.company_name                                              AS [Company Name],
-    nsr.date_of_purchase                                        AS [Date of Purchase],
+    tt.date_of_purchase                                         AS [Date of Purchase],
     poe.original_event_date                                     AS [Original Event Scheduled Date],
     t.confirmation_status                                       AS [Attendance Confirmed],
     cb.changed_by                                               AS [Confirmed By],
@@ -648,8 +633,8 @@ SELECT
     NULL                                                        AS [Vertical Summit?],
     t.status                                                    AS [Status],
     NULL                                                        AS [Products Sold At the Event],
-    CASE WHEN x360.cv_customer_id IS NOT NULL THEN 'Yes'
-         ELSE NULL END                                          AS [10X360],
+    x360.is_10x360_flag                                         AS [10X360],
+    x360.first_10x360_purchase_date                             AS [First 10X360 Purchase Date],
     ryb.ItemName                                                AS [RYB],
     NULL                                                        AS [TCV],
     c.cv_customer_id                                            AS [CV-CustomerID],
@@ -668,7 +653,8 @@ SELECT
     sc.[Registration Day 1],
     sc.[Registration Day 2],
     sc.[Registration Day 3],
-    sc.[10X Vertical Summit]
+    sc.[10X Vertical Summit],
+    t.ticket_id                                                 AS [Ticket ID]
 
 FROM tickets t
 
@@ -702,6 +688,9 @@ LEFT JOIN refunds r
 
 LEFT JOIN ticket_notes tn
     ON t.ticket_id = tn.ticket_id
+
+LEFT JOIN ticket_transactions tt
+    ON t.sales_order_id = tt.sales_order_id
 
 LEFT JOIN netsuite ns
     ON ('Sales Order #' + t.sales_order_id) COLLATE Latin1_General_100_BIN2_UTF8
@@ -747,8 +736,7 @@ UNION ALL
 
 -- ============================================================
 -- FINAL SELECT — PART 2: No-Show Reset Records
--- Session check-in columns will be NULL for no-show resets by design
--- (these tickets did not attend the event)
+-- Session check-in columns NULL by design (did not attend)
 -- ============================================================
 
 SELECT
@@ -769,7 +757,7 @@ SELECT
     tnsr.attendee_phone                                         AS [Phone Number],
     tnsr.purchaser_email                                        AS [Customer Email],
     tnsr.customer_name                                          AS [Company Name],
-    nsr2.date_of_purchase                                       AS [Date of Purchase],
+    tt2.date_of_purchase                                        AS [Date of Purchase],
     poe2.original_event_date                                    AS [Original Event Scheduled Date],
     tnsr.confirmation_status                                    AS [Attendance Confirmed],
     tnsr.confirmed_by                                           AS [Confirmed By],
@@ -847,8 +835,8 @@ SELECT
     NULL                                                        AS [Vertical Summit?],
     tnsr.source_ticket_status                                   AS [Status],
     NULL                                                        AS [Products Sold At the Event],
-    CASE WHEN x360_2.cv_customer_id IS NOT NULL THEN 'Yes'
-         ELSE NULL END                                          AS [10X360],
+    x360_2.is_10x360_flag                                       AS [10X360],
+    x360_2.first_10x360_purchase_date                           AS [First 10X360 Purchase Date],
     ryb2.ItemName                                               AS [RYB],
     NULL                                                        AS [TCV],
     tnsr.cv_customer_id                                         AS [CV-CustomerID],
@@ -859,7 +847,8 @@ SELECT
     NULL                                                        AS [Registration Day 1],
     NULL                                                        AS [Registration Day 2],
     NULL                                                        AS [Registration Day 3],
-    NULL                                                        AS [10X Vertical Summit]
+    NULL                                                        AS [10X Vertical Summit],
+    tnsr.ticket_id                                               AS [Ticket ID]
 
 FROM [tenxhub].[ticket-manager].[ticket_no_show_resets] tnsr
 
@@ -890,6 +879,9 @@ LEFT JOIN refunds r2
 
 LEFT JOIN ticket_notes tn2
     ON tnsr.ticket_id = tn2.ticket_id
+
+LEFT JOIN ticket_transactions tt2
+    ON tnsr.sales_order_id = tt2.sales_order_id
 
 LEFT JOIN netsuite ns2
     ON ('Sales Order #' + tnsr.sales_order_id) COLLATE Latin1_General_100_BIN2_UTF8
