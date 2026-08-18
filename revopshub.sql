@@ -283,50 +283,19 @@ confirmed_by AS (
 ),
 
 -- ============================================================
--- SOURCE OF PURCHASE (POS vs Concierge — kept for backward compat)
--- ============================================================
-
-source_of_purchase AS (
-    SELECT
-        t.ticket_id,
-        CASE
-            WHEN h.action = 'Event assigned/unassigned'
-             AND h.old_value IS NOT NULL AND h.old_value != ''
-             AND h.new_value IS NOT NULL AND h.new_value != ''
-            THEN 'Concierge'
-            ELSE 'POS'
-        END AS source_of_purchase
-    FROM [tenxhub].[ticket-manager].[tickets] t
-    LEFT JOIN (
-        SELECT
-            ticket_id,
-            action,
-            old_value,
-            new_value,
-            ROW_NUMBER() OVER (PARTITION BY ticket_id ORDER BY changed_at DESC) AS rn
-        FROM [tenxhub].[ticket-manager].[history]
-        WHERE action = 'Event assigned/unassigned'
-    ) h ON t.ticket_id = h.ticket_id AND h.rn = 1
-    WHERE t.product_name LIKE '%Elite Edge%'
-      AND LOWER(t.status) IN ('scheduled', 'attended', 'no show', 'assigned', 'reserved')
-),
-
--- ============================================================
--- SEAT SOURCE — NEW COLUMN
--- Primary: POS original event date comparison (bronze_OrdersSelectedEventsFULL)
--- Fallback: tenxhub history table (for tickets without POS match, e.g. January)
--- Categories: Sales, Rescheduled, Undecided, Comp
+-- SOURCE OF PURCHASE + SEAT SOURCE
+-- POS date comparison drives Source of Purchase
+-- Source of Purchase drives Seat Source
 --
--- Logic:
---   IF POS match exists:
---     Same event date → Sales
---     Different event + history has both old+new → Rescheduled
---     Different event + no full reschedule history → Undecided
---   IF no POS match (fallback):
---     History has both old+new values → Rescheduled
---     History has human-touched Event assigned/unassigned → Undecided
---     No sales_order + is_comped = 1 → Comp
---     Everything else → Sales
+-- Source of Purchase logic:
+--   POS path: original event = current event → POS, different → Concierge
+--   Fallback: history reschedule or human-touched → Concierge, else → POS
+--
+-- Seat Source logic (AppScript rule: POS = always Sales):
+--   POS → Sales (always, no exceptions)
+--   Concierge + has both old+new in history → Rescheduled
+--   Concierge + is_comped = 1 + no reschedule history → Comp
+--   Concierge + everything else → Undecided
 -- ============================================================
 
 -- Step 1: Get original purchased event date from POS
@@ -389,36 +358,50 @@ history_concierge AS (
       AND changed_by IS NOT NULL
 ),
 
--- Step 5: Final Seat Source classification
-seat_source AS (
+-- Step 5: Source of Purchase (POS date comparison primary, history fallback)
+source_of_purchase AS (
     SELECT
         t.ticket_id,
         CASE
-            -- PRIMARY: POS path available — compare original vs current event date
+            -- POS path available: compare dates
             WHEN poe.original_event_date IS NOT NULL THEN
                 CASE
-                    -- Same event = Sales (direct sale, attended as planned)
-                    WHEN CAST(t.event_date AS DATE) = poe.original_event_date THEN 'Sales'
-                    -- Different event + Concierge actively moved = Rescheduled
-                    WHEN hr.ticket_id IS NOT NULL THEN 'Rescheduled'
-                    -- Different event + no active move = Undecided (passively pushed)
-                    ELSE 'Undecided'
+                    WHEN CAST(t.event_date AS DATE) = poe.original_event_date THEN 'POS'
+                    ELSE 'Concierge'
                 END
-            -- FALLBACK: No POS match — use history signals
-            -- Full reschedule history = Rescheduled
-            WHEN hr.ticket_id IS NOT NULL THEN 'Rescheduled'
-            -- Human-touched Concierge = Undecided (was in Concierge pipeline)
-            WHEN hc.ticket_id IS NOT NULL THEN 'Undecided'
-            -- Comp: no sales order + is_comped
-            WHEN (t.sales_order_id IS NULL OR t.sales_order_id = '')
-             AND t.is_comped = 1 THEN 'Comp'
-            -- Default: Sales
-            ELSE 'Sales'
-        END AS seat_source
+            -- Fallback: no POS match
+            WHEN hr.ticket_id IS NOT NULL THEN 'Concierge'
+            WHEN hc.ticket_id IS NOT NULL THEN 'Concierge'
+            ELSE 'POS'
+        END AS source_of_purchase
     FROM [tenxhub].[ticket-manager].[tickets] t
     LEFT JOIN pos_original_event_dedup poe ON t.ticket_id = poe.ticket_id
     LEFT JOIN history_rescheduled hr       ON t.ticket_id = hr.ticket_id
     LEFT JOIN history_concierge hc         ON t.ticket_id = hc.ticket_id
+    WHERE t.product_name LIKE '%Elite Edge%'
+      AND LOWER(t.status) IN ('scheduled', 'attended', 'no show', 'assigned', 'reserved')
+),
+
+-- Step 6: Seat Source (driven by Source of Purchase)
+-- POS → Sales (always). Concierge → Rescheduled / Undecided / Comp
+seat_source AS (
+    SELECT
+        t.ticket_id,
+        CASE
+            -- POS = always Sales
+            WHEN sop.source_of_purchase = 'POS' THEN 'Sales'
+            -- Concierge + full reschedule history = Rescheduled
+            WHEN sop.source_of_purchase = 'Concierge' AND hr.ticket_id IS NOT NULL THEN 'Rescheduled'
+            -- Concierge + is_comped + no reschedule = Comp
+            WHEN sop.source_of_purchase = 'Concierge' AND t.is_comped = 1 AND hr.ticket_id IS NULL THEN 'Comp'
+            -- Concierge + everything else = Undecided
+            WHEN sop.source_of_purchase = 'Concierge' THEN 'Undecided'
+            -- Safety default
+            ELSE 'Sales'
+        END AS seat_source
+    FROM [tenxhub].[ticket-manager].[tickets] t
+    INNER JOIN source_of_purchase sop ON t.ticket_id = sop.ticket_id
+    LEFT JOIN history_rescheduled hr  ON t.ticket_id = hr.ticket_id
     WHERE t.product_name LIKE '%Elite Edge%'
       AND LOWER(t.status) IN ('scheduled', 'attended', 'no show', 'assigned', 'reserved')
 )
