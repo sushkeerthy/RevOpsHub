@@ -1,39 +1,14 @@
--- ============================================================
--- RevOps AppScript Pipeline — HYBRID v2 (Optimized)
--- Cardone Ventures | Team Neo | August 2026
+-- RevOps AppScript Pipeline — v3 Final (Date of Purchase fix)
+-- Cardone Ventures | Team Neo | July 2026
 --
--- Architecture:
---   PART A : SELECT * FROM rpt_revopsattendees  (events < 2026-08-11)
---            → No compute. Reads directly from materialized table.
---   PART B : Live query                          (events >= 2026-08-11)
---            → session_checkins replaced with kiosk_usage + kiosk_registrations
---
--- Optimizations applied (vs v1):
---   [OPT-1] dim_customer_base — DimCustomer read once instead of 4x
---           dim_customer, hubspot_abr, is_10x360, ryb_purchases all reference it
---           DATA SHAPE: unchanged — same rows, same WHERE CVCustomerID IS NOT NULL
---
---   [OPT-2] attendees scoped to active ticket pool (both tickets + no_show_resets)
---           DATA SHAPE: unchanged — still LEFT JOIN; tickets with no attendee still return NULL
---
---   [OPT-3] customers scoped to active ticket pool + COLLATE applied at source
---           DATA SHAPE: unchanged — LEFT JOIN; COLLATE at source = same result as at join time
---
---   [OPT-4] history_rescheduled + history_was_undecided scoped to tickets
---           DATA SHAPE: unchanged — only used by source_of_purchase/seat_attribution (Part B1 only)
---
---   [OPT-5] ticket_transactions scoped to active sales_order_ids (both sources)
---           DATA SHAPE: unchanged — LEFT JOIN; missing sales_order_ids still return NULL date
---
--- Known remaining issues (cannot fix without schema changes):
---   - netsuite CTE: 'Sales Order #' + sales_order_id string concat in JOIN blocks index seek
---   - pos_original_event: CONCAT join through NetSuite → POS, same issue
---
--- SQL Server syntax note:
---   WITH block must appear BEFORE the first SELECT in a UNION ALL.
---   Part A (materialized table) is the first SELECT after the CTE block.
---   CTEs are in scope for all three parts of the UNION ALL.
--- ============================================================
+-- Changes from previous version:
+--   1. is_10x360 CTE → DimCustomer.First10X360PurchaseDate (refund-aware, BDF/WRTC excluded)
+--   2. [First 10X360 Purchase Date] added as new column in Part 1 and Part 2
+--   3. session_checkins CTE → name-based matching (covers all events, not just June 1321)
+--   4. [Ticket ID] added to final SELECT (Part 1 and Part 2)
+--   5. [Date of Purchase] switched from NetSuite silver_Transaction → tenxhub transactions.transaction_date
+--        (198/198 coverage on July validation, vs. 72/198 via NetSuite bridge)
+--        NetSuite CTEs (netsuite / netsuite_names) KEPT — still required for Sales Person 1/2 names
 
 WITH
 
@@ -63,15 +38,12 @@ tickets AS (
         t.is_comped,
         t.undecided_timestamp,
         t.enter_dtm,
-        t.is_walkin
+        t.is_walkin 
     FROM [tenxhub].[ticket-manager].[tickets] t
     WHERE t.event_type_id = 12
-      AND (t.event_date >= '2026-08-11' OR t.event_date IS NULL)  -- INCREMENTAL CUTOFF + unscheduled tickets
       AND LOWER(t.status) IN ('scheduled', 'attended', 'no show', 'no_show', 'assigned', 'reserved', 'expired')
 ),
 
--- [OPT-2] Scoped to ticket pool from both Part B1 and B2
--- LEFT JOIN in final SELECT means tickets with no attendee still return NULL rows — shape unchanged
 attendees AS (
     SELECT
         a.attendee_id,
@@ -81,61 +53,10 @@ attendees AS (
         a.attendee_phone,
         a.dietary_restrictions
     FROM [tenxhub].[ticket-manager].[attendees] a
-    WHERE a.attendee_id IN (
-        SELECT attendee_id FROM tickets             WHERE attendee_id IS NOT NULL
-        UNION
-        SELECT attendee_id FROM [tenxhub].[ticket-manager].[ticket_no_show_resets]
-        WHERE event_type_id = 12 AND event_date >= '2026-08-11' AND attendee_id IS NOT NULL
-    )
-),
-
--- [OPT-3a] Scoped to ticket pool from both Part B1 and B2
--- [OPT-3b] COLLATE applied at source — removes COLLATE from all downstream JOINs
---          Result is identical: same collation rule, just evaluated once at read time
-customers AS (
-    SELECT
-        c.id                                                     AS customer_id,
-        c.name                                                   AS company_name,
-        c.cv_customer_id COLLATE Latin1_General_100_BIN2_UTF8   AS cv_customer_id,
-        c.abr,
-        c.vertical,
-        c.status                                                 AS customer_status
-    FROM [tenxhub].[ticket-manager].[customers] c
-    WHERE c.id IN (
-        SELECT customer_id FROM tickets             WHERE customer_id IS NOT NULL
-        UNION
-        SELECT customer_id FROM [tenxhub].[ticket-manager].[ticket_no_show_resets]
-        WHERE event_type_id = 12 AND event_date >= '2026-08-11' AND customer_id IS NOT NULL
-    )
-),
-
--- ============================================================
--- [OPT-1] dim_customer_base — single DimCustomer scan
--- Replaces 4 separate reads of [DWH].[dbo].[DimCustomer]
--- dim_customer, hubspot_abr, is_10x360, ryb_purchases all derive from here
--- ============================================================
-
-dim_customer_base AS (
-    SELECT
-        dc.CVCustomerID COLLATE Latin1_General_100_BIN2_UTF8    AS cv_customer_id,
-        dc.NetSuiteID,
-        dc.VerticalName                                          AS vertical,
-        dc.AnnualBusinessRevenueName,
-        CASE WHEN dc.First10X360PurchaseDate IS NOT NULL
-             THEN 'Yes' ELSE NULL END                            AS is_10x360_flag,
-        dc.First10X360PurchaseDate                               AS first_10x360_purchase_date
-    FROM [DWH].[dbo].[DimCustomer] dc
-    WHERE dc.CVCustomerID IS NOT NULL
-),
-
-dim_customer AS (
-    SELECT cv_customer_id, vertical
-    FROM dim_customer_base
 ),
 
 -- ============================================================
 -- ROOM ORIGINATION
--- Uses Profisee silver_EventSession — NOT deprecated
 -- ============================================================
 
 sessions AS (
@@ -167,43 +88,69 @@ sessions AS (
 ),
 
 -- ============================================================
--- SESSION CHECK-INS — kiosk_usage (replaces a10XEvents, deprecated Aug 2026)
+-- SESSION CHECK-INS (a10XEvents — all events, name-based matching)
 -- ============================================================
 
 session_checkins AS (
     SELECT
-        ku.ticket_id COLLATE Latin1_General_100_BIN2_UTF8          AS ticket_id,
-        MAX(CASE WHEN kr.session_name LIKE '%General Session Day 1%'
-                 THEN 'Yes' ELSE NULL END)                         AS [Registration Day 1],
-        MAX(CASE WHEN kr.session_name LIKE '%General Session Day 2%'
-                 THEN 'Yes' ELSE NULL END)                         AS [Registration Day 2],
-        MAX(CASE WHEN kr.session_name LIKE '%General Session Day 3%'
-                 THEN 'Yes' ELSE NULL END)                         AS [Registration Day 3],
-        MAX(CASE WHEN kr.session_name LIKE '%Vertical Summit%'
-                 THEN 'Yes' ELSE NULL END)                         AS [10X Vertical Summit]
-    FROM [tenxhub].[ticket-manager].[kiosk_usage] ku
-    JOIN [tenxhub].[ticket-manager].[kiosk_registrations] kr
-        ON  ku.session_id = kr.session_id
-        AND ku.event_id   = kr.event_id
-    WHERE ku.flow_type          = 'badge_printed'
-      AND ku.check_in_undone_at IS NULL
-      AND ku.ticket_id          IS NOT NULL
-    GROUP BY ku.ticket_id
+        x.TicketID COLLATE Latin1_General_100_BIN2_UTF8          AS ticket_id,
+        MAX(CASE WHEN (s.SessionName LIKE '%Registration Day 1%'
+                    OR s.SessionName LIKE '%Day 1 Registration%')
+                  AND s.SessionName NOT LIKE '%DO NOT USE%'
+                 THEN 'Yes' ELSE NULL END)                        AS [Registration Day 1],
+        MAX(CASE WHEN (s.SessionName LIKE '%Registration Day 2%'
+                    OR s.SessionName LIKE '%Day 2 Registration%')
+                  AND s.SessionName NOT LIKE '%DO NOT USE%'
+                 THEN 'Yes' ELSE NULL END)                        AS [Registration Day 2],
+        MAX(CASE WHEN (s.SessionName LIKE '%Registration Day 3%'
+                    OR s.SessionName LIKE '%Day 3 Registration%')
+                  AND s.SessionName NOT LIKE '%DO NOT USE%'
+                 THEN 'Yes' ELSE NULL END)                        AS [Registration Day 3],
+        MAX(CASE WHEN s.SessionName LIKE '%Vertical Summit%'
+                 THEN 'Yes' ELSE NULL END)                        AS [10X Vertical Summit]
+    FROM [a10XEvents].[dbo].[silver_EventSessionAttendees] sa
+    INNER JOIN [a10XEvents].[dbo].[xref_Ticket] x
+        ON  sa.TicketID  = x.a10XEventsTicketID
+        AND sa.EventID   = x.a10XEventsEventID
+    INNER JOIN [a10XEvents].[dbo].[silver_EventSessions] s
+        ON  sa.SessionID = s.SessionID
+        AND sa.EventID   = s.EventID
+    GROUP BY x.TicketID
 ),
 
 -- ============================================================
--- HUBSPOT ABR
--- [OPT-1] References dim_customer_base instead of DimCustomer directly
+-- CUSTOMERS / COMPANY
 -- ============================================================
+
+customers AS (
+    SELECT
+        c.id              AS customer_id,
+        c.name            AS company_name,
+        c.cv_customer_id,
+        c.abr,
+        c.vertical,
+        c.status          AS customer_status
+    FROM [tenxhub].[ticket-manager].[customers] c
+),
+
+dim_customer AS (
+    SELECT
+        dc.CVCustomerID
+            COLLATE Latin1_General_100_BIN2_UTF8  AS cv_customer_id,
+        dc.VerticalName                           AS vertical
+    FROM [DWH].[dbo].[DimCustomer] dc
+    WHERE dc.CVCustomerID IS NOT NULL
+),
 
 hubspot_abr AS (
     SELECT
-        dcb.cv_customer_id,
+        dc.CVCustomerID
+            COLLATE Latin1_General_100_BIN2_UTF8                          AS cv_customer_id,
         COALESCE(
             NULLIF(sc.AnnualBusinessRevenue COLLATE Latin1_General_100_BIN2_UTF8, ''),
-            dcb.AnnualBusinessRevenueName
-        )                                                          AS annual_business_revenue
-    FROM dim_customer_base dcb
+            dc.AnnualBusinessRevenueName
+        )                                                                 AS annual_business_revenue
+    FROM [DWH].[dbo].[DimCustomer] dc
     LEFT JOIN (
         SELECT
             CVCustomerID COLLATE Latin1_General_100_BIN2_UTF8 AS CVCustomerID,
@@ -214,7 +161,9 @@ hubspot_abr AS (
             ) AS rn
         FROM [Hubspot].[dbo].[silver_Companies]
         WHERE CVCustomerID IS NOT NULL
-    ) hc ON dcb.cv_customer_id = hc.CVCustomerID AND hc.rn = 1
+    ) hc ON dc.CVCustomerID COLLATE Latin1_General_100_BIN2_UTF8
+          = hc.CVCustomerID
+        AND hc.rn = 1
     LEFT JOIN (
         SELECT
             ca.CompanyID,
@@ -229,49 +178,54 @@ hubspot_abr AS (
         WHERE sc.BusinessOwner = 1
           AND sc.AnnualBusinessRevenue IS NOT NULL
     ) sc ON hc.CompanyID = sc.CompanyID AND sc.rn = 1
+    WHERE dc.CVCustomerID IS NOT NULL
 ),
 
 -- ============================================================
 -- RYB PURCHASES
--- [OPT-1] References dim_customer_base instead of DimCustomer directly
 -- ============================================================
 
 ryb_purchases AS (
-    SELECT cv_customer_id, ItemName
+    SELECT
+        cv_customer_id,
+        ItemName
     FROM (
         SELECT
-            dcb.cv_customer_id,
-            txn.ItemName COLLATE Latin1_General_100_BIN2_UTF8   AS ItemName,
+            dc.CVCustomerID
+                COLLATE Latin1_General_100_BIN2_UTF8    AS cv_customer_id,
+            txn.ItemName
+                COLLATE Latin1_General_100_BIN2_UTF8    AS ItemName,
             ROW_NUMBER() OVER (
-                PARTITION BY dcb.cv_customer_id
+                PARTITION BY dc.CVCustomerID
                 ORDER BY txn.TransactionDate DESC
             ) AS rn
-        FROM dim_customer_base dcb
+        FROM [DWH].[dbo].[DimCustomer] dc
         JOIN [NetSuite].[dbo].[silver_Transaction] txn
-            ON dcb.NetSuiteID = txn.EntityID
+            ON dc.NetSuiteID = txn.EntityID
         WHERE txn.ItemName LIKE '%RYB%'
           AND txn.SubsidiaryID = 11
           AND txn.TransactionType IN ('Sales Order', 'Cash Sale')
+          AND dc.CVCustomerID IS NOT NULL
     ) x
     WHERE rn = 1
 ),
 
 -- ============================================================
--- 10X360 FLAG + FIRST PURCHASE DATE
--- [OPT-1] References dim_customer_base instead of DimCustomer directly
+-- 10X360 FLAG + FIRST PURCHASE DATE (via DimCustomer)
 -- ============================================================
 
 is_10x360 AS (
     SELECT DISTINCT
-        cv_customer_id,
-        is_10x360_flag,
-        first_10x360_purchase_date
-    FROM dim_customer_base
+        CVCustomerID COLLATE Latin1_General_100_BIN2_UTF8  AS cv_customer_id,
+        CASE WHEN First10X360PurchaseDate IS NOT NULL
+             THEN 'Yes' ELSE NULL END                      AS is_10x360_flag,
+        First10X360PurchaseDate                            AS first_10x360_purchase_date
+    FROM [DWH].[dbo].[DimCustomer]
+    WHERE CVCustomerID IS NOT NULL
 ),
 
 -- ============================================================
 -- REFUNDS
--- Already scoped — unchanged
 -- ============================================================
 
 refunds AS (
@@ -281,17 +235,17 @@ refunds AS (
     FROM [tenxhub].[ticket-manager].[transactions] tr
     WHERE tr.refund_amount > 0
       AND tr.sales_order_id IN (
-          SELECT sales_order_id FROM tickets WHERE sales_order_id IS NOT NULL
+          SELECT sales_order_id FROM tickets
+          WHERE sales_order_id IS NOT NULL
           UNION
           SELECT sales_order_id FROM [tenxhub].[ticket-manager].[ticket_no_show_resets]
-          WHERE event_type_id = 12 AND event_date >= '2026-08-11' AND sales_order_id IS NOT NULL
+          WHERE event_type_id = 12 AND sales_order_id IS NOT NULL
       )
     GROUP BY tr.sales_order_id
 ),
 
 -- ============================================================
 -- NOTES
--- Already scoped — unchanged
 -- ============================================================
 
 ticket_notes AS (
@@ -305,15 +259,16 @@ ticket_notes AS (
           SELECT ticket_id FROM tickets
           UNION
           SELECT ticket_id FROM [tenxhub].[ticket-manager].[ticket_no_show_resets]
-          WHERE event_type_id = 12 AND event_date >= '2026-08-11'
+          WHERE event_type_id = 12
       )
     GROUP BY n.ticket_id
 ),
 
 -- ============================================================
--- TICKET TRANSACTIONS — Date of Purchase
--- [OPT-5] Scoped to active sales_order_ids from both sources
--- DATA SHAPE: unchanged — still LEFT JOIN in final SELECT; NULL date if no match
+-- TICKET TRANSACTIONS — Date of Purchase (NEW — replaces NetSuite for this column)
+-- Source: tenxhub.ticket-manager.transactions.transaction_date
+-- Validated: 198/198 coverage on July tickets w/ sales_order_id (vs. 72/198 via NetSuite)
+-- Native join on sales_order_id — no cross-database bridge or COLLATE needed
 -- ============================================================
 
 ticket_transactions AS (
@@ -321,21 +276,12 @@ ticket_transactions AS (
         tr.sales_order_id,
         MIN(tr.transaction_date) AS date_of_purchase
     FROM [tenxhub].[ticket-manager].[transactions] tr
-    WHERE tr.sales_order_id IN (
-        SELECT sales_order_id FROM tickets
-        WHERE sales_order_id IS NOT NULL
-        UNION
-        SELECT sales_order_id FROM [tenxhub].[ticket-manager].[ticket_no_show_resets]
-        WHERE event_type_id = 12 AND event_date >= '2026-08-11' AND sales_order_id IS NOT NULL
-    )
+    WHERE tr.sales_order_id IS NOT NULL
     GROUP BY tr.sales_order_id
 ),
 
 -- ============================================================
--- NETSUITE (Sales Rep names only)
--- NOTE: 'Sales Order #' + sales_order_id concat in JOIN blocks index seek on
---       TransactionDisplayName. Cannot fix without IT adding a parsed column
---       to silver_Transaction. Left as-is intentionally.
+-- NETSUITE (Sales Rep names ONLY — Date of Purchase moved to ticket_transactions above)
 -- ============================================================
 
 netsuite AS (
@@ -352,11 +298,12 @@ netsuite AS (
       AND nt.TransactionLineID != 0
       AND nt.TransactionDisplayName COLLATE Latin1_General_100_BIN2_UTF8 IN (
           SELECT ('Sales Order #' + sales_order_id) COLLATE Latin1_General_100_BIN2_UTF8
-          FROM tickets WHERE sales_order_id IS NOT NULL
+          FROM tickets
+          WHERE sales_order_id IS NOT NULL
           UNION
           SELECT ('Sales Order #' + sales_order_id) COLLATE Latin1_General_100_BIN2_UTF8
           FROM [tenxhub].[ticket-manager].[ticket_no_show_resets]
-          WHERE event_type_id = 12 AND event_date >= '2026-08-11' AND sales_order_id IS NOT NULL
+          WHERE event_type_id = 12 AND sales_order_id IS NOT NULL
       )
     GROUP BY nt.TransactionDisplayName
 ),
@@ -441,11 +388,12 @@ hubspot_email AS (
 
 -- ============================================================
 -- CONFIRMED BY
--- Already scoped to tickets — unchanged
 -- ============================================================
 
 confirmed_by AS (
-    SELECT ticket_id, changed_by
+    SELECT
+        ticket_id,
+        changed_by
     FROM (
         SELECT
             h.ticket_id,
@@ -454,13 +402,15 @@ confirmed_by AS (
         FROM [tenxhub].[ticket-manager].[history] h
         WHERE h.action = 'Confirmation status updated'
           AND h.changed_by NOT IN ('System', 'bulk-import')
-          AND h.ticket_id IN (SELECT ticket_id FROM tickets)
+          AND h.ticket_id IN (
+              SELECT ticket_id FROM tickets
+          )
     ) x
     WHERE rn = 1
 ),
 
 -- ============================================================
--- SOURCE OF PURCHASE
+-- SOURCE OF PURCHASE + SEAT ATTRIBUTION
 -- ============================================================
 
 pos_original_event AS (
@@ -469,9 +419,12 @@ pos_original_event AS (
         pos_evt.StartDate AS original_event_date
     FROM tickets t
     INNER JOIN (
-        SELECT DISTINCT TransactionID, TransactionDisplayName
+        SELECT DISTINCT
+            TransactionID,
+            TransactionDisplayName
         FROM [NetSuite].[dbo].[silver_Transaction]
-        WHERE TransactionType = 'Sales Order' AND TransactionLineID = 0
+        WHERE TransactionType = 'Sales Order'
+          AND TransactionLineID = 0
     ) ns_link
         ON ns_link.TransactionDisplayName = CONCAT('Sales Order #', t.sales_order_id)
             COLLATE Latin1_General_100_BIN2_UTF8
@@ -479,10 +432,12 @@ pos_original_event AS (
         ON bof.sales_order_ids COLLATE Latin1_General_100_BIN2_UTF8
          = CAST(ns_link.TransactionID AS VARCHAR(20)) COLLATE Latin1_General_100_BIN2_UTF8
     INNER JOIN [POS].[dbo].[bronze_OrdersSelectedEventsFULL] bose
-        ON bose.order_id = bof.order_id COLLATE Latin1_General_100_BIN2_UTF8
+        ON bose.order_id = bof.order_id
+            COLLATE Latin1_General_100_BIN2_UTF8
         AND bose.selected_event_name LIKE '%Elite Edge%'
     INNER JOIN [POS].[dbo].[silver_Events] pos_evt
-        ON pos_evt.EventID = bose.selected_event_id COLLATE Latin1_General_100_BIN2_UTF8
+        ON pos_evt.EventID = bose.selected_event_id
+            COLLATE Latin1_General_100_BIN2_UTF8
     WHERE t.sales_order_id IS NOT NULL
 
     UNION ALL
@@ -492,9 +447,12 @@ pos_original_event AS (
         pos_evt.StartDate AS original_event_date
     FROM [tenxhub].[ticket-manager].[ticket_no_show_resets] tnsr
     INNER JOIN (
-        SELECT DISTINCT TransactionID, TransactionDisplayName
+        SELECT DISTINCT
+            TransactionID,
+            TransactionDisplayName
         FROM [NetSuite].[dbo].[silver_Transaction]
-        WHERE TransactionType = 'Sales Order' AND TransactionLineID = 0
+        WHERE TransactionType = 'Sales Order'
+          AND TransactionLineID = 0
     ) ns_link
         ON ns_link.TransactionDisplayName = CONCAT('Sales Order #', tnsr.sales_order_id)
             COLLATE Latin1_General_100_BIN2_UTF8
@@ -502,27 +460,23 @@ pos_original_event AS (
         ON bof.sales_order_ids COLLATE Latin1_General_100_BIN2_UTF8
          = CAST(ns_link.TransactionID AS VARCHAR(20)) COLLATE Latin1_General_100_BIN2_UTF8
     INNER JOIN [POS].[dbo].[bronze_OrdersSelectedEventsFULL] bose
-        ON bose.order_id = bof.order_id COLLATE Latin1_General_100_BIN2_UTF8
+        ON bose.order_id = bof.order_id
+            COLLATE Latin1_General_100_BIN2_UTF8
         AND bose.selected_event_name LIKE '%Elite Edge%'
     INNER JOIN [POS].[dbo].[silver_Events] pos_evt
-        ON pos_evt.EventID = bose.selected_event_id COLLATE Latin1_General_100_BIN2_UTF8
+        ON pos_evt.EventID = bose.selected_event_id
+            COLLATE Latin1_General_100_BIN2_UTF8
     WHERE tnsr.sales_order_id IS NOT NULL
       AND tnsr.event_type_id = 12
-      AND tnsr.event_date >= '2026-08-11'
 ),
 
 pos_original_event_dedup AS (
-    SELECT ticket_id, MIN(original_event_date) AS original_event_date
+    SELECT
+        ticket_id,
+        MIN(original_event_date) AS original_event_date
     FROM pos_original_event
     GROUP BY ticket_id
 ),
-
--- ============================================================
--- HISTORY CTEs
--- [OPT-4] Scoped to tickets — full table scan eliminated
--- DATA SHAPE: unchanged — only consumed by source_of_purchase + seat_attribution
---             which are only in Part B1 (active tickets). No Part B2 dependency.
--- ============================================================
 
 history_rescheduled AS (
     SELECT DISTINCT ticket_id
@@ -530,14 +484,12 @@ history_rescheduled AS (
     WHERE action = 'Event assigned/unassigned'
       AND old_value IS NOT NULL AND old_value != ''
       AND new_value IS NOT NULL AND new_value != ''
-      AND ticket_id IN (SELECT ticket_id FROM tickets)   -- [OPT-4]
 ),
 
 history_was_undecided AS (
     SELECT DISTINCT ticket_id
     FROM [tenxhub].[ticket-manager].[history]
     WHERE action = 'Status changed to undecided'
-      AND ticket_id IN (SELECT ticket_id FROM tickets)   -- [OPT-4]
 ),
 
 source_of_purchase AS (
@@ -573,29 +525,13 @@ seat_attribution AS (
             ELSE 'Sales'
         END AS seat_attribution
     FROM tickets t
-    INNER JOIN source_of_purchase sop  ON t.ticket_id = sop.ticket_id
-    LEFT JOIN history_rescheduled hr   ON t.ticket_id = hr.ticket_id
+    INNER JOIN source_of_purchase sop ON t.ticket_id = sop.ticket_id
+    LEFT JOIN history_rescheduled hr  ON t.ticket_id = hr.ticket_id
     LEFT JOIN history_was_undecided hwu ON t.ticket_id = hwu.ticket_id
 )
 
-
 -- ============================================================
--- PART A — HISTORICAL (pre Aug 11 2026)
--- No computation — reads directly from materialized table
--- CTEs above are defined but not used here; they serve Parts B1 and B2
--- ============================================================
-
-SELECT *
-FROM [a10XEvents].[dbo].[rpt_revopsattendees]
-WHERE DATESelectionDNT < '2026-08-11'
-
-
-UNION ALL
-
-
--- ============================================================
--- PART B1 — LIVE: Active Pipeline Tickets (>= Aug 11 2026)
--- [OPT-3b] COLLATE removed from cv_customer_id JOINs — already normalized in customers CTE
+-- FINAL SELECT — PART 1: Active Pipeline Tickets
 -- ============================================================
 
 SELECT
@@ -708,7 +644,7 @@ SELECT
          ELSE 'No'
     END                                                         AS [Attended],
     'No'                                                        AS [Is No Show],
-    CASE WHEN t.is_walkin = 1 THEN 'Yes' ELSE 'No' END         AS [Walk-In],
+    CASE WHEN t.is_walkin = 1 THEN 'Yes' ELSE 'No' END AS [Walk-In],
     sc.[Registration Day 1],
     sc.[Registration Day 2],
     sc.[Registration Day 3],
@@ -716,37 +652,86 @@ SELECT
     t.ticket_id                                                 AS [Ticket ID]
 
 FROM tickets t
-LEFT JOIN attendees a              ON t.attendee_id = a.attendee_id
-LEFT JOIN sessions s               ON t.ticket_id = s.ticket_id
-LEFT JOIN customers c              ON t.customer_id = c.customer_id
-LEFT JOIN dim_customer dc          ON c.cv_customer_id = dc.cv_customer_id          -- COLLATE dropped: normalized in customers CTE
-LEFT JOIN hubspot_abr habr         ON c.cv_customer_id = habr.cv_customer_id        -- COLLATE dropped
-LEFT JOIN ryb_purchases ryb        ON c.cv_customer_id = ryb.cv_customer_id         -- COLLATE dropped
-LEFT JOIN is_10x360 x360           ON c.cv_customer_id = x360.cv_customer_id        -- COLLATE dropped
-LEFT JOIN refunds r                ON t.sales_order_id = r.sales_order_id
-LEFT JOIN ticket_notes tn          ON t.ticket_id = tn.ticket_id
-LEFT JOIN ticket_transactions tt   ON t.sales_order_id = tt.sales_order_id
-LEFT JOIN netsuite ns              ON ('Sales Order #' + t.sales_order_id) COLLATE Latin1_General_100_BIN2_UTF8 = ns.TransactionDisplayName
-LEFT JOIN netsuite_names nsr       ON ns.TransactionDisplayName = nsr.TransactionDisplayName
-LEFT JOIN dim_employee e1          ON nsr.SalesRepName  COLLATE Latin1_General_100_BIN2_UTF8 = e1.EmployeeName
-LEFT JOIN dim_employee e2          ON nsr.SalesRep2Name COLLATE Latin1_General_100_BIN2_UTF8 = e2.EmployeeName
-LEFT JOIN hubspot_person hp        ON a.person_id = hp.CVPersonID
-LEFT JOIN hubspot_email he         ON LOWER(a.attendee_email) COLLATE Latin1_General_100_BIN2_UTF8 = he.Email
-LEFT JOIN confirmed_by cb          ON t.ticket_id = cb.ticket_id
-LEFT JOIN source_of_purchase sop   ON t.ticket_id = sop.ticket_id
-LEFT JOIN pos_original_event_dedup poe ON t.ticket_id = poe.ticket_id
-LEFT JOIN seat_attribution sa      ON t.ticket_id = sa.ticket_id
-LEFT JOIN session_checkins sc      ON t.ticket_id COLLATE Latin1_General_100_BIN2_UTF8 = sc.ticket_id
+
+LEFT JOIN attendees a
+    ON t.attendee_id = a.attendee_id
+
+LEFT JOIN sessions s
+    ON t.ticket_id = s.ticket_id
+
+LEFT JOIN customers c
+    ON t.customer_id = c.customer_id
+
+LEFT JOIN dim_customer dc
+    ON c.cv_customer_id COLLATE Latin1_General_100_BIN2_UTF8
+     = dc.cv_customer_id
+
+LEFT JOIN hubspot_abr habr
+    ON c.cv_customer_id COLLATE Latin1_General_100_BIN2_UTF8
+     = habr.cv_customer_id
+
+LEFT JOIN ryb_purchases ryb
+    ON c.cv_customer_id COLLATE Latin1_General_100_BIN2_UTF8
+     = ryb.cv_customer_id
+
+LEFT JOIN is_10x360 x360
+    ON c.cv_customer_id COLLATE Latin1_General_100_BIN2_UTF8
+     = x360.cv_customer_id
+
+LEFT JOIN refunds r
+    ON t.sales_order_id = r.sales_order_id
+
+LEFT JOIN ticket_notes tn
+    ON t.ticket_id = tn.ticket_id
+
+LEFT JOIN ticket_transactions tt
+    ON t.sales_order_id = tt.sales_order_id
+
+LEFT JOIN netsuite ns
+    ON ('Sales Order #' + t.sales_order_id) COLLATE Latin1_General_100_BIN2_UTF8
+     = ns.TransactionDisplayName
+
+LEFT JOIN netsuite_names nsr
+    ON ns.TransactionDisplayName = nsr.TransactionDisplayName
+
+LEFT JOIN dim_employee e1
+    ON nsr.SalesRepName COLLATE Latin1_General_100_BIN2_UTF8
+     = e1.EmployeeName
+
+LEFT JOIN dim_employee e2
+    ON nsr.SalesRep2Name COLLATE Latin1_General_100_BIN2_UTF8
+     = e2.EmployeeName
+
+LEFT JOIN hubspot_person hp
+    ON a.person_id = hp.CVPersonID
+
+LEFT JOIN hubspot_email he
+    ON LOWER(a.attendee_email) COLLATE Latin1_General_100_BIN2_UTF8
+     = he.Email
+
+LEFT JOIN confirmed_by cb
+    ON t.ticket_id = cb.ticket_id
+
+LEFT JOIN source_of_purchase sop
+    ON t.ticket_id = sop.ticket_id
+
+LEFT JOIN pos_original_event_dedup poe
+    ON t.ticket_id = poe.ticket_id
+
+LEFT JOIN seat_attribution sa
+    ON t.ticket_id = sa.ticket_id
+
+LEFT JOIN session_checkins sc
+    ON t.ticket_id COLLATE Latin1_General_100_BIN2_UTF8
+     = sc.ticket_id
 
 
 UNION ALL
 
 
 -- ============================================================
--- PART B2 — LIVE: No-Show Reset Records (>= Aug 11 2026)
+-- FINAL SELECT — PART 2: No-Show Reset Records
 -- Session check-in columns NULL by design (did not attend)
--- Note: tnsr.cv_customer_id comes from ticket_no_show_resets directly
---       (not through customers CTE) so COLLATE still needed on those joins
 -- ============================================================
 
 SELECT
@@ -858,30 +843,67 @@ SELECT
     NULL                                                        AS [Registration Day 2],
     NULL                                                        AS [Registration Day 3],
     NULL                                                        AS [10X Vertical Summit],
-    tnsr.ticket_id                                              AS [Ticket ID]
+    tnsr.ticket_id                                               AS [Ticket ID]
 
 FROM [tenxhub].[ticket-manager].[ticket_no_show_resets] tnsr
-LEFT JOIN attendees a2             ON tnsr.attendee_id = a2.attendee_id
-LEFT JOIN customers c2             ON tnsr.customer_id = c2.customer_id
-LEFT JOIN dim_customer dc2         ON tnsr.cv_customer_id COLLATE Latin1_General_100_BIN2_UTF8 = dc2.cv_customer_id
-LEFT JOIN hubspot_abr habr2        ON tnsr.cv_customer_id COLLATE Latin1_General_100_BIN2_UTF8 = habr2.cv_customer_id
-LEFT JOIN ryb_purchases ryb2       ON tnsr.cv_customer_id COLLATE Latin1_General_100_BIN2_UTF8 = ryb2.cv_customer_id
-LEFT JOIN is_10x360 x360_2         ON tnsr.cv_customer_id COLLATE Latin1_General_100_BIN2_UTF8 = x360_2.cv_customer_id
-LEFT JOIN refunds r2               ON tnsr.sales_order_id = r2.sales_order_id
-LEFT JOIN ticket_notes tn2         ON tnsr.ticket_id = tn2.ticket_id
-LEFT JOIN ticket_transactions tt2  ON tnsr.sales_order_id = tt2.sales_order_id
-LEFT JOIN netsuite ns2             ON ('Sales Order #' + tnsr.sales_order_id) COLLATE Latin1_General_100_BIN2_UTF8 = ns2.TransactionDisplayName
-LEFT JOIN netsuite_names nsr2      ON ns2.TransactionDisplayName = nsr2.TransactionDisplayName
-LEFT JOIN dim_employee e3          ON nsr2.SalesRepName  COLLATE Latin1_General_100_BIN2_UTF8 = e3.EmployeeName
-LEFT JOIN dim_employee e4          ON nsr2.SalesRep2Name COLLATE Latin1_General_100_BIN2_UTF8 = e4.EmployeeName
-LEFT JOIN hubspot_email he2        ON LOWER(tnsr.attendee_email) COLLATE Latin1_General_100_BIN2_UTF8 = he2.Email
-LEFT JOIN pos_original_event_dedup poe2 ON tnsr.ticket_id = poe2.ticket_id
+
+LEFT JOIN attendees a2
+    ON tnsr.attendee_id = a2.attendee_id
+
+LEFT JOIN customers c2
+    ON tnsr.customer_id = c2.customer_id
+
+LEFT JOIN dim_customer dc2
+    ON tnsr.cv_customer_id COLLATE Latin1_General_100_BIN2_UTF8
+     = dc2.cv_customer_id
+
+LEFT JOIN hubspot_abr habr2
+    ON tnsr.cv_customer_id COLLATE Latin1_General_100_BIN2_UTF8
+     = habr2.cv_customer_id
+
+LEFT JOIN ryb_purchases ryb2
+    ON tnsr.cv_customer_id COLLATE Latin1_General_100_BIN2_UTF8
+     = ryb2.cv_customer_id
+
+LEFT JOIN is_10x360 x360_2
+    ON tnsr.cv_customer_id COLLATE Latin1_General_100_BIN2_UTF8
+     = x360_2.cv_customer_id
+
+LEFT JOIN refunds r2
+    ON tnsr.sales_order_id = r2.sales_order_id
+
+LEFT JOIN ticket_notes tn2
+    ON tnsr.ticket_id = tn2.ticket_id
+
+LEFT JOIN ticket_transactions tt2
+    ON tnsr.sales_order_id = tt2.sales_order_id
+
+LEFT JOIN netsuite ns2
+    ON ('Sales Order #' + tnsr.sales_order_id) COLLATE Latin1_General_100_BIN2_UTF8
+     = ns2.TransactionDisplayName
+
+LEFT JOIN netsuite_names nsr2
+    ON ns2.TransactionDisplayName = nsr2.TransactionDisplayName
+
+LEFT JOIN dim_employee e3
+    ON nsr2.SalesRepName COLLATE Latin1_General_100_BIN2_UTF8
+     = e3.EmployeeName
+
+LEFT JOIN dim_employee e4
+    ON nsr2.SalesRep2Name COLLATE Latin1_General_100_BIN2_UTF8
+     = e4.EmployeeName
+
+LEFT JOIN hubspot_email he2
+    ON LOWER(tnsr.attendee_email) COLLATE Latin1_General_100_BIN2_UTF8
+     = he2.Email
+
+LEFT JOIN pos_original_event_dedup poe2
+    ON tnsr.ticket_id = poe2.ticket_id
 
 WHERE tnsr.event_type_id = 12
-  AND tnsr.event_date >= '2026-08-11'            -- INCREMENTAL CUTOFF
-
 
 ORDER BY
-    DATESelectionDNT,
-    CompanyName,
-    AttendeeFullName;
+    [DATE Selection (DNT)],
+    [Company Name],
+    [Attendee Full Name];
+
