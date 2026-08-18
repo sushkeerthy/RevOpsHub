@@ -1,4 +1,3 @@
-'''sql_query = """
 -- ============================================================
 -- RevOps AppScript Pipeline — HYBRID v2 (Optimized)
 -- Cardone Ventures | Team Neo | August 2026
@@ -886,10 +885,3 @@ ORDER BY
     DATESelectionDNT,
     CompanyName,
     AttendeeFullName;
-
-"""
-
-df = pd.read_sql(sql_query, conn)
-
-print(df.head())
-'''
