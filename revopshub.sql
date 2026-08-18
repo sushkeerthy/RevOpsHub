@@ -26,8 +26,9 @@ tickets AS (
         t.person_id,
         t.sales_order_id,
         t.purchaser_email,
-        t.is_comped
-    FROM [dbo].[tenxhub_tickets] t
+        t.is_comped,
+        t.undecided_timestamp
+    FROM [tenxhub].[ticket-manager].[tickets] t
     WHERE t.product_name LIKE '%Elite Edge%'
       AND LOWER(t.status) IN ('scheduled', 'attended', 'no show', 'assigned', 'reserved')
 ),
@@ -40,7 +41,7 @@ attendees AS (
         a.attendee_email,
         a.attendee_phone,
         a.dietary_restrictions
-    FROM [dbo].[tenxhub_attendees] a
+    FROM [tenxhub].[ticket-manager].[attendees] a
 ),
 
 -- ============================================================
@@ -60,16 +61,14 @@ sessions AS (
                 WHEN es.SessionName LIKE '%10X360 Implementation%' THEN '10X360 Implementation'
                 ELSE NULL
             END AS room_type
-        FROM [dbo].[tenxhub_attendee_ticket_sessions] ats
-        JOIN [dbo].[tenxhub_attendee_tickets] at
+        FROM [tenxhub].[ticket-manager].[attendee_ticket_sessions] ats
+        JOIN [tenxhub].[ticket-manager].[attendee_tickets] at
             ON ats.attendee_ticket_id = at.attendee_ticket_id
-        LEFT JOIN [dbo].[Profisee_EventSession] es
+        LEFT JOIN [Profisee].[dbo].[silver_EventSession] es
             ON ats.event_session_code COLLATE Latin1_General_100_BIN2_UTF8
-             = es.EventSessionCode    COLLATE Latin1_General_100_BIN2_UTF8
+             = es.CVEventSessionID    COLLATE Latin1_General_100_BIN2_UTF8
         WHERE at.attendee_id IN (
-            SELECT attendee_id FROM [dbo].[tenxhub_tickets]
-            WHERE product_name LIKE '%Elite Edge%'
-              AND LOWER(status) IN ('scheduled', 'attended', 'no show', 'assigned', 'reserved')
+            SELECT attendee_id FROM tickets
         )
     ) x
     WHERE room_type IS NOT NULL
@@ -86,45 +85,89 @@ customers AS (
         c.name            AS company_name,
         c.cv_customer_id,
         c.abr,
-        c.vertical
-    FROM [dbo].[tenxhub_customers] c
+        c.vertical,
+        c.status          AS customer_status
+    FROM [tenxhub].[ticket-manager].[customers] c
 ),
 
--- dim_customer: HubSpot (business owner contact) first, DWH fallback
--- Chain: DimCustomer → silver_Companies → silver_ContactCompanyAssoc
---        → silver_Contacts WHERE BusinessOwner = 1
+-- dim_customer: DWH only (simpler path)
 dim_customer AS (
     SELECT
         dc.CVCustomerID
-            COLLATE Latin1_General_100_BIN2_UTF8                          AS cv_customer_id,
-        COALESCE(
-            NULLIF(sc.CompanyVertical COLLATE Latin1_General_100_BIN2_UTF8, ''),
-            dc.VerticalName
-        )                                                                 AS vertical,
-        COALESCE(
-            NULLIF(sc.AnnualBusinessRevenue COLLATE Latin1_General_100_BIN2_UTF8, ''),
-            dc.AnnualBusinessRevenueName
-        )                                                                 AS annual_business_revenue
-    FROM [dbo].[DimCustomer] dc
-    LEFT JOIN [dbo].[Hubspot_Companies] hc
-        ON dc.CVCustomerID COLLATE Latin1_General_100_BIN2_UTF8
-         = hc.CVCustomerID COLLATE Latin1_General_100_BIN2_UTF8
-    LEFT JOIN (
-        SELECT
-            ca.CompanyID,
-            sc.CompanyVertical   COLLATE Latin1_General_100_BIN2_UTF8    AS CompanyVertical,
-            sc.AnnualBusinessRevenue COLLATE Latin1_General_100_BIN2_UTF8 AS AnnualBusinessRevenue,
-            ROW_NUMBER() OVER (
-                PARTITION BY ca.CompanyID
-                ORDER BY sc.UpdatedAtUTC DESC
-            ) AS rn
-        FROM [dbo].[Hubspot_ContactCompanyAssoc] ca
-        JOIN [dbo].[Hubspot_Contacts] sc
-            ON ca.ContactID = sc.ContactID
-        WHERE sc.BusinessOwner = 1
-          AND (sc.CompanyVertical IS NOT NULL OR sc.AnnualBusinessRevenue IS NOT NULL)
-    ) sc ON hc.CompanyID = sc.CompanyID AND sc.rn = 1
+            COLLATE Latin1_General_100_BIN2_UTF8  AS cv_customer_id,
+        dc.VerticalName                           AS vertical,
+        dc.AnnualBusinessRevenueName              AS annual_business_revenue
+    FROM [DWH].[dbo].[DimCustomer] dc
     WHERE dc.CVCustomerID IS NOT NULL
+),
+
+-- COMMENTED OUT: HubSpot (business owner contact) first, DWH fallback
+-- Coverage: HubSpot+DWH = 89.1% Vertical, 90.8% ABR vs DWH-only = 87.6%, 88.9%
+-- Chain: DimCustomer → silver_Companies → silver_ContactCompanyAssoc
+--        → silver_Contacts WHERE BusinessOwner = 1
+-- dim_customer AS (
+--     SELECT
+--         dc.CVCustomerID
+--             COLLATE Latin1_General_100_BIN2_UTF8                          AS cv_customer_id,
+--         COALESCE(
+--             NULLIF(sc.CompanyVertical COLLATE Latin1_General_100_BIN2_UTF8, ''),
+--             dc.VerticalName
+--         )                                                                 AS vertical,
+--         COALESCE(
+--             NULLIF(sc.AnnualBusinessRevenue COLLATE Latin1_General_100_BIN2_UTF8, ''),
+--             dc.AnnualBusinessRevenueName
+--         )                                                                 AS annual_business_revenue
+--     FROM [DWH].[dbo].[DimCustomer] dc
+--     LEFT JOIN [Hubspot].[dbo].[silver_Companies] hc
+--         ON dc.CVCustomerID COLLATE Latin1_General_100_BIN2_UTF8
+--          = hc.CVCustomerID COLLATE Latin1_General_100_BIN2_UTF8
+--     LEFT JOIN (
+--         SELECT
+--             ca.CompanyID,
+--             sc.CompanyVertical   COLLATE Latin1_General_100_BIN2_UTF8    AS CompanyVertical,
+--             sc.AnnualBusinessRevenue COLLATE Latin1_General_100_BIN2_UTF8 AS AnnualBusinessRevenue,
+--             ROW_NUMBER() OVER (
+--                 PARTITION BY ca.CompanyID
+--                 ORDER BY sc.UpdatedAtUTC DESC
+--             ) AS rn
+--         FROM [Hubspot].[dbo].[silver_ContactCompanyAssoc] ca
+--         JOIN [Hubspot].[dbo].[silver_Contacts] sc
+--             ON ca.ContactID = sc.ContactID
+--         WHERE sc.BusinessOwner = 1
+--           AND (sc.CompanyVertical IS NOT NULL OR sc.AnnualBusinessRevenue IS NOT NULL)
+--     ) sc ON hc.CompanyID = sc.CompanyID AND sc.rn = 1
+--     WHERE dc.CVCustomerID IS NOT NULL
+-- ),
+
+-- ============================================================
+-- RYB PURCHASES (via DimCustomer → NetSuite)
+-- Chain: customers.cv_customer_id → DimCustomer.CVCustomerID → NetSuiteID
+--        → silver_Transaction.EntityID WHERE ItemName LIKE '%RYB%'
+-- ============================================================
+
+ryb_purchases AS (
+    SELECT
+        cv_customer_id,
+        ItemName
+    FROM (
+        SELECT
+            dc.CVCustomerID
+                COLLATE Latin1_General_100_BIN2_UTF8    AS cv_customer_id,
+            txn.ItemName
+                COLLATE Latin1_General_100_BIN2_UTF8    AS ItemName,
+            ROW_NUMBER() OVER (
+                PARTITION BY dc.CVCustomerID
+                ORDER BY txn.TransactionDate DESC
+            ) AS rn
+        FROM [DWH].[dbo].[DimCustomer] dc
+        JOIN [NetSuite].[dbo].[silver_Transaction] txn
+            ON dc.NetSuiteID = txn.EntityID
+        WHERE txn.ItemName LIKE '%RYB%'
+          AND txn.SubsidiaryID = 11
+          AND txn.TransactionType IN ('Sales Order', 'Cash Sale')
+          AND dc.CVCustomerID IS NOT NULL
+    ) x
+    WHERE rn = 1
 ),
 
 -- ============================================================
@@ -135,12 +178,11 @@ refunds AS (
     SELECT
         tr.sales_order_id,
         'Yes - ' + STRING_AGG(tr.refund_reason, '; ') AS refund_info
-    FROM [dbo].[tenxhub_transactions] tr
+    FROM [tenxhub].[ticket-manager].[transactions] tr
     WHERE tr.refund_amount > 0
       AND tr.sales_order_id IN (
-          SELECT sales_order_id FROM [dbo].[tenxhub_tickets]
-          WHERE product_name LIKE '%Elite Edge%'
-            AND LOWER(status) IN ('scheduled', 'attended', 'no show', 'assigned', 'reserved')
+          SELECT sales_order_id FROM tickets
+          WHERE sales_order_id IS NOT NULL
       )
     GROUP BY tr.sales_order_id
 ),
@@ -152,14 +194,12 @@ refunds AS (
 ticket_notes AS (
     SELECT
         n.ticket_id,
-        STRING_AGG(n.note, CHAR(10)) AS notes
-    FROM [dbo].[tenxhub_notes] n
+        STRING_AGG(n.note, ' | ') AS notes
+    FROM [tenxhub].[ticket-manager].[notes] n
     WHERE n.note NOT LIKE '%Created from POS%'
       AND n.note NOT LIKE '%Created from Fabric%'
       AND n.ticket_id IN (
-          SELECT ticket_id FROM [dbo].[tenxhub_tickets]
-          WHERE product_name LIKE '%Elite Edge%'
-            AND LOWER(status) IN ('scheduled', 'attended', 'no show', 'assigned', 'reserved')
+          SELECT ticket_id FROM tickets
       )
     GROUP BY n.ticket_id
 ),
@@ -180,15 +220,13 @@ netsuite AS (
         MAX(nt.SalesRep2Name)
             COLLATE Latin1_General_100_BIN2_UTF8          AS SalesRep2Name,
         MIN(nt.TransactionID)                             AS TransactionID
-    FROM [dbo].[NetSuite_Transaction] nt
+    FROM [NetSuite].[dbo].[silver_Transaction] nt
     WHERE nt.TransactionType    = 'Sales Order'
       AND nt.TransactionLineID != 0
       AND nt.TransactionDisplayName COLLATE Latin1_General_100_BIN2_UTF8 IN (
           SELECT ('Sales Order #' + sales_order_id) COLLATE Latin1_General_100_BIN2_UTF8
-          FROM [dbo].[tenxhub_tickets]
-          WHERE product_name LIKE '%Elite Edge%'
-            AND LOWER(status) IN ('scheduled', 'attended', 'no show', 'assigned', 'reserved')
-            AND sales_order_id IS NOT NULL
+          FROM tickets
+          WHERE sales_order_id IS NOT NULL
       )
     GROUP BY nt.TransactionDisplayName
 ),
@@ -234,7 +272,7 @@ dim_employee AS (
     SELECT DISTINCT
         de.EmployeeName COLLATE Latin1_General_100_BIN2_UTF8 AS EmployeeName,
         de.Email        COLLATE Latin1_General_100_BIN2_UTF8 AS Email
-    FROM [dbo].[DimEmployee] de
+    FROM [DWH].[dbo].[DimEmployee] de
     WHERE de.Email IS NOT NULL
 ),
 
@@ -246,7 +284,7 @@ hubspot_person AS (
     SELECT
         hc.CVPersonID  COLLATE Latin1_General_100_BIN2_UTF8 AS CVPersonID,
         hc.ContactID
-    FROM [dbo].[Hubspot_Contacts] hc
+    FROM [HubSpot].[dbo].[silver_Contacts] hc
     WHERE hc.CVPersonID IS NOT NULL
 ),
 
@@ -254,7 +292,7 @@ hubspot_email AS (
     SELECT
         LOWER(hc.Email) COLLATE Latin1_General_100_BIN2_UTF8 AS Email,
         hc.ContactID
-    FROM [dbo].[Hubspot_Contacts] hc
+    FROM [HubSpot].[dbo].[silver_Contacts] hc
     WHERE hc.Email IS NOT NULL
 ),
 
@@ -271,13 +309,11 @@ confirmed_by AS (
             h.ticket_id,
             h.changed_by,
             ROW_NUMBER() OVER (PARTITION BY h.ticket_id ORDER BY h.changed_at DESC) AS rn
-        FROM [dbo].[tenxhub_history] h
+        FROM [tenxhub].[ticket-manager].[history] h
         WHERE h.action = 'Confirmation status updated'
           AND h.changed_by NOT IN ('System', 'bulk-import')
           AND h.ticket_id IN (
-              SELECT ticket_id FROM [dbo].[tenxhub_tickets]
-              WHERE product_name LIKE '%Elite Edge%'
-                AND LOWER(status) IN ('scheduled', 'attended', 'no show', 'assigned', 'reserved')
+              SELECT ticket_id FROM tickets
           )
     ) x
     WHERE rn = 1
@@ -289,14 +325,22 @@ confirmed_by AS (
 -- Source of Purchase drives Seat Attribution
 --
 -- Source of Purchase logic:
---   POS path: original event = current event → POS, different → Concierge
---   Fallback: history reschedule or human-touched → Concierge, else → POS
+--   1. POS path: original event = current event → POS, different → Concierge
+--   2. Status changed to undecided (history) → Concierge
+--   3. undecided_timestamp populated → Concierge
+--   4. Reschedule history (both old+new values) → Concierge
+--   5. Default → POS
 --
--- Seat Attribution logic (AppScript rule: POS = always Sales):
---   POS → Sales (always, no exceptions)
---   Concierge + reschedule history + is_comped = 1 → Rescheduled + Comp
---   Concierge + reschedule history + is_comped = 0 → Rescheduled
---   Concierge + no reschedule + is_comped = 1 → Comp
+-- Removed: human-touched history_concierge (unreliable — tech team does
+--   Concierge work via bulk-import/service, can't distinguish by actor)
+-- Added: undecided_timestamp + Status changed to undecided (direct evidence)
+--
+-- Seat Attribution logic (comp check first, then POS/Concierge split):
+--   is_comped = 1 + reschedule history → Rescheduled + Comp (any source)
+--   is_comped = 1 + no reschedule → Comp (any source)
+--   not comped + reschedule + was undecided → Rescheduled + Undecided
+--   not comped + reschedule + not undecided → Rescheduled
+--   POS + not comped → Sales
 --   Concierge + everything else → Undecided
 -- ============================================================
 
@@ -306,30 +350,28 @@ pos_original_event AS (
     SELECT
         t.ticket_id,
         pos_evt.StartDate AS original_event_date
-    FROM [dbo].[tenxhub_tickets] t
+    FROM tickets t
     INNER JOIN (
         SELECT DISTINCT
             TransactionID,
             TransactionDisplayName
-        FROM [dbo].[NetSuite_Transaction]
+        FROM [NetSuite].[dbo].[silver_Transaction]
         WHERE TransactionType = 'Sales Order'
           AND TransactionLineID = 0
     ) ns_link
         ON ns_link.TransactionDisplayName = CONCAT('Sales Order #', t.sales_order_id)
             COLLATE Latin1_General_100_BIN2_UTF8
-    INNER JOIN [dbo].[POS_OrdersFULL] bof
+    INNER JOIN [POS].[dbo].[bronze_OrdersFULL] bof
         ON bof.sales_order_ids COLLATE Latin1_General_100_BIN2_UTF8
          = CAST(ns_link.TransactionID AS VARCHAR(20)) COLLATE Latin1_General_100_BIN2_UTF8
-    INNER JOIN [dbo].[POS_OrdersSelectedEventsFULL] bose
+    INNER JOIN [POS].[dbo].[bronze_OrdersSelectedEventsFULL] bose
         ON bose.order_id = bof.order_id
             COLLATE Latin1_General_100_BIN2_UTF8
         AND bose.selected_event_name LIKE '%Elite Edge%'
-    INNER JOIN [dbo].[POS_Events] pos_evt
+    INNER JOIN [POS].[dbo].[silver_Events] pos_evt
         ON pos_evt.EventID = bose.selected_event_id
             COLLATE Latin1_General_100_BIN2_UTF8
-    WHERE t.product_name LIKE '%Elite Edge%'
-      AND LOWER(t.status) IN ('scheduled', 'attended', 'no show', 'assigned', 'reserved')
-      AND t.sales_order_id IS NOT NULL
+    WHERE t.sales_order_id IS NOT NULL
 ),
 
 -- Step 2: Deduplicate POS results (one row per ticket)
@@ -344,23 +386,23 @@ pos_original_event_dedup AS (
 -- Step 3: History — full reschedule (both old+new values, any actor)
 history_rescheduled AS (
     SELECT DISTINCT ticket_id
-    FROM [dbo].[tenxhub_history]
+    FROM [tenxhub].[ticket-manager].[history]
     WHERE action = 'Event assigned/unassigned'
       AND old_value IS NOT NULL AND old_value != ''
       AND new_value IS NOT NULL AND new_value != ''
 ),
 
--- Step 4: History — human-touched Concierge (fallback for no-POS tickets)
--- Excludes system actors: bulk-import, service, System, POS, FabricImport
-history_concierge AS (
+-- Step 4: History — tickets that were in the undecided pool
+-- Direct evidence: action = 'Status changed to undecided' means ticket entered the pool
+history_was_undecided AS (
     SELECT DISTINCT ticket_id
-    FROM [dbo].[tenxhub_history]
-    WHERE action = 'Event assigned/unassigned'
-      AND changed_by NOT IN ('bulk-import', 'service', 'System', 'POS', 'FabricImport')
-      AND changed_by IS NOT NULL
+    FROM [tenxhub].[ticket-manager].[history]
+    WHERE action = 'Status changed to undecided'
 ),
 
--- Step 5: Source of Purchase (POS date comparison primary, history fallback)
+-- Step 5: Source of Purchase (POS date comparison primary, undecided signals + history fallback)
+-- Removed: human-touched history_concierge (unreliable — tech team does Concierge work)
+-- Added: undecided_timestamp + Status changed to undecided (direct evidence of undecided pool)
 source_of_purchase AS (
     SELECT
         t.ticket_id,
@@ -371,43 +413,49 @@ source_of_purchase AS (
                     WHEN CAST(t.event_date AS DATE) = poe.original_event_date THEN 'POS'
                     ELSE 'Concierge'
                 END
-            -- Fallback: no POS match
+            -- Was in undecided pool (history)
+            WHEN hwu.ticket_id IS NOT NULL THEN 'Concierge'
+            -- Has undecided_timestamp (direct field evidence)
+            WHEN t.undecided_timestamp IS NOT NULL THEN 'Concierge'
+            -- Reschedule history (both old+new values)
             WHEN hr.ticket_id IS NOT NULL THEN 'Concierge'
-            WHEN hc.ticket_id IS NOT NULL THEN 'Concierge'
+            -- Default
             ELSE 'POS'
         END AS source_of_purchase
-    FROM [dbo].[tenxhub_tickets] t
+    FROM tickets t
     LEFT JOIN pos_original_event_dedup poe ON t.ticket_id = poe.ticket_id
     LEFT JOIN history_rescheduled hr       ON t.ticket_id = hr.ticket_id
-    LEFT JOIN history_concierge hc         ON t.ticket_id = hc.ticket_id
-    WHERE t.product_name LIKE '%Elite Edge%'
-      AND LOWER(t.status) IN ('scheduled', 'attended', 'no show', 'assigned', 'reserved')
+    LEFT JOIN history_was_undecided hwu    ON t.ticket_id = hwu.ticket_id
 ),
 
--- Step 6: Seat Attribution (driven by Source of Purchase)
--- POS → Sales (always). Concierge → Rescheduled / Rescheduled + Comp / Undecided / Comp
+-- Step 6: Seat Attribution
+-- Comp check runs FIRST (is_comped = 1 → Comp or Rescheduled+Comp regardless of POS/Concierge)
+-- Then reschedule + undecided check (was in pool AND moved between events)
+-- Then POS/Concierge split for remaining tickets
+-- Comp Type + Source of Purchase columns distinguish Sales team comp vs Concierge comp
 seat_attribution AS (
     SELECT
         t.ticket_id,
         CASE
-            -- POS = always Sales
+            -- Comped + reschedule history = Rescheduled + Comp (any source)
+            WHEN COALESCE(t.is_comped, 0) = 1 AND hr.ticket_id IS NOT NULL THEN 'Rescheduled + Comp'
+            -- Comped + no reschedule = Comp (any source)
+            WHEN COALESCE(t.is_comped, 0) = 1 THEN 'Comp'
+            -- Not comped + reschedule + was undecided = Rescheduled + Undecided
+            WHEN hr.ticket_id IS NOT NULL AND (hwu.ticket_id IS NOT NULL OR t.undecided_timestamp IS NOT NULL) THEN 'Rescheduled + Undecided'
+            -- Not comped + reschedule + not undecided = Rescheduled
+            WHEN hr.ticket_id IS NOT NULL THEN 'Rescheduled'
+            -- POS + not comped = Sales
             WHEN sop.source_of_purchase = 'POS' THEN 'Sales'
-            -- Concierge + full reschedule history + comped = Rescheduled + Comp
-            WHEN sop.source_of_purchase = 'Concierge' AND hr.ticket_id IS NOT NULL AND t.is_comped = 1 THEN 'Rescheduled + Comp'
-            -- Concierge + full reschedule history + not comped = Rescheduled
-            WHEN sop.source_of_purchase = 'Concierge' AND hr.ticket_id IS NOT NULL AND t.is_comped = 0 THEN 'Rescheduled'
-            -- Concierge + no reschedule + comped = Comp
-            WHEN sop.source_of_purchase = 'Concierge' AND t.is_comped = 1 AND hr.ticket_id IS NULL THEN 'Comp'
             -- Concierge + everything else = Undecided
             WHEN sop.source_of_purchase = 'Concierge' THEN 'Undecided'
             -- Safety default
             ELSE 'Sales'
         END AS seat_attribution
-    FROM [dbo].[tenxhub_tickets] t
+    FROM tickets t
     INNER JOIN source_of_purchase sop ON t.ticket_id = sop.ticket_id
     LEFT JOIN history_rescheduled hr  ON t.ticket_id = hr.ticket_id
-    WHERE t.product_name LIKE '%Elite Edge%'
-      AND LOWER(t.status) IN ('scheduled', 'attended', 'no show', 'assigned', 'reserved')
+    LEFT JOIN history_was_undecided hwu ON t.ticket_id = hwu.ticket_id
 )
 
 -- ============================================================
@@ -490,8 +538,8 @@ SELECT
 
     -- Col 29: Comp Type (replaces Is Comped — distinguishes comp with/without sales order)
     CASE
-        WHEN t.is_comped = 1 AND t.sales_order_id IS NOT NULL THEN 'Comp - Sales Order'
-        WHEN t.is_comped = 1 AND t.sales_order_id IS NULL     THEN 'Comp - No Sales Order'
+        WHEN COALESCE(t.is_comped, 0) = 1 AND t.sales_order_id IS NOT NULL THEN 'Comp - Sales Order'
+        WHEN COALESCE(t.is_comped, 0) = 1 AND t.sales_order_id IS NULL     THEN 'Comp - No Sales Order'
         ELSE NULL
     END                                                         AS [Comp Type],
 
@@ -501,11 +549,18 @@ SELECT
     -- Col 32: HubSpot Contact ID
     COALESCE(hp.ContactID, he.ContactID)                        AS [Hubspot Contact ID],
 
-    -- Col 33-34: ABR & Vertical (HubSpot primary via dim_customer, tenxhub fallback)
+    -- Col 33-34: ABR & Vertical (DWH primary, tenxhub fallback)
     COALESCE(dc.annual_business_revenue, c.abr)                 AS [Annual Business Revenue],
     COALESCE(dc.vertical, c.vertical)                           AS [Vertical],
 
-    -- Col 35: Vertical Summit (manual)
+    -- Col 35: Elite Status (tenxhub customers.status: 3=E125, 4=E250)
+    CASE c.customer_status
+        WHEN '3' THEN 'E125'
+        WHEN '4' THEN 'E250'
+        ELSE NULL
+    END                                                         AS [Elite Status],
+
+    -- Col 36: Vertical Summit (manual)
     NULL                                                        AS [Vertical Summit?],
 
     -- Col 36: Status
@@ -514,6 +569,7 @@ SELECT
     -- Col 37-39: Manual columns
     NULL                                                        AS [Products Sold At the Event],
     nsr.is_10x360                                               AS [10X360],
+    ryb.ItemName                                                AS [RYB],
     NULL                                                        AS [TCV]
 
 FROM tickets t
@@ -530,6 +586,10 @@ LEFT JOIN customers c
 LEFT JOIN dim_customer dc
     ON c.cv_customer_id COLLATE Latin1_General_100_BIN2_UTF8
      = dc.cv_customer_id
+
+LEFT JOIN ryb_purchases ryb
+    ON c.cv_customer_id COLLATE Latin1_General_100_BIN2_UTF8
+     = ryb.cv_customer_id
 
 LEFT JOIN refunds r
     ON t.sales_order_id = r.sales_order_id
