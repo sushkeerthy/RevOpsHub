@@ -1,5 +1,5 @@
 -- RevOps AppScript Pipeline — Standalone Query
--- Cardone Ventures | Team Neo | April 2026
+-- Cardone Ventures | Team Neo | April 21 2026
 
 WITH
 
@@ -335,13 +335,14 @@ confirmed_by AS (
 --   Concierge work via bulk-import/service, can't distinguish by actor)
 -- Added: undecided_timestamp + Status changed to undecided (direct evidence)
 --
--- Seat Attribution logic (comp check first, then POS/Concierge split):
---   is_comped = 1 + reschedule history → Rescheduled + Comp (any source)
---   is_comped = 1 + no reschedule → Comp (any source)
---   not comped + reschedule + was undecided → Rescheduled + Undecided
---   not comped + reschedule + not undecided → Rescheduled
---   POS + not comped → Sales
+-- Seat Attribution logic (true comp first, then reschedule, then POS/Concierge):
+--   is_comped = 1 + no sales order + reschedule → Rescheduled + Comp
+--   is_comped = 1 + no sales order + no reschedule → Comp
+--   reschedule + was undecided → Rescheduled + Undecided
+--   reschedule + not undecided → Rescheduled
+--   POS → Sales (comped with sales order flows here too)
 --   Concierge + everything else → Undecided
+-- Note: Comp Type column still shows ALL comps for visibility
 -- ============================================================
 
 -- Step 1: Get original purchased event date from POS
@@ -429,23 +430,24 @@ source_of_purchase AS (
 ),
 
 -- Step 6: Seat Attribution
--- Comp check runs FIRST (is_comped = 1 → Comp or Rescheduled+Comp regardless of POS/Concierge)
+-- True comp check runs FIRST (is_comped = 1 AND no sales order → Comp)
+-- Comped tickets WITH a sales order flow through normal POS/Concierge logic
+-- Comp Type column still shows all comps for visibility
 -- Then reschedule + undecided check (was in pool AND moved between events)
 -- Then POS/Concierge split for remaining tickets
--- Comp Type + Source of Purchase columns distinguish Sales team comp vs Concierge comp
 seat_attribution AS (
     SELECT
         t.ticket_id,
         CASE
-            -- Comped + reschedule history = Rescheduled + Comp (any source)
-            WHEN COALESCE(t.is_comped, 0) = 1 AND hr.ticket_id IS NOT NULL THEN 'Rescheduled + Comp'
-            -- Comped + no reschedule = Comp (any source)
-            WHEN COALESCE(t.is_comped, 0) = 1 THEN 'Comp'
-            -- Not comped + reschedule + was undecided = Rescheduled + Undecided
+            -- True comp (no sales order) + reschedule = Rescheduled + Comp
+            WHEN COALESCE(t.is_comped, 0) = 1 AND (t.sales_order_id IS NULL OR t.sales_order_id = '') AND hr.ticket_id IS NOT NULL THEN 'Rescheduled + Comp'
+            -- True comp (no sales order) + no reschedule = Comp
+            WHEN COALESCE(t.is_comped, 0) = 1 AND (t.sales_order_id IS NULL OR t.sales_order_id = '') THEN 'Comp'
+            -- Not true comp + reschedule + was undecided = Rescheduled + Undecided
             WHEN hr.ticket_id IS NOT NULL AND (hwu.ticket_id IS NOT NULL OR t.undecided_timestamp IS NOT NULL) THEN 'Rescheduled + Undecided'
-            -- Not comped + reschedule + not undecided = Rescheduled
+            -- Reschedule + not undecided = Rescheduled
             WHEN hr.ticket_id IS NOT NULL THEN 'Rescheduled'
-            -- POS + not comped = Sales
+            -- POS = Sales
             WHEN sop.source_of_purchase = 'POS' THEN 'Sales'
             -- Concierge + everything else = Undecided
             WHEN sop.source_of_purchase = 'Concierge' THEN 'Undecided'
