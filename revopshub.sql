@@ -551,7 +551,29 @@ SELECT
     COALESCE(hp.ContactID, he.ContactID)                        AS [Hubspot Contact ID],
 
     -- Col 33: ABR (HubSpot contact-level primary, DWH fallback via hubspot_abr, tenxhub last resort)
-    COALESCE(habr.annual_business_revenue, c.abr)               AS [Annual Business Revenue],
+    -- Standardized to DWH format ($X Million+) for consistency
+    CASE COALESCE(habr.annual_business_revenue, c.abr)
+        WHEN '1 Million+'          THEN '$1 Million+'
+        WHEN '2 Million +'         THEN '$2 Million+'
+        WHEN '2 Million+'          THEN '$2 Million+'
+        WHEN '3 Million+'          THEN '$3 Million+'
+        WHEN '4 Million+'          THEN '$4 Million+'
+        WHEN '5 Million+'          THEN '$5 Million+'
+        WHEN '6 Million+'          THEN '$6 Million+'
+        WHEN '7 Million+'          THEN '$7 Million+'
+        WHEN '8 Million+'          THEN '$8 Million+'
+        WHEN '9 Million+'          THEN '$9 Million+'
+        WHEN '10 Million+'         THEN '$10 Million+'
+        WHEN '20 Million+'         THEN '$20 Million+'
+        WHEN '30 Million+'         THEN '$30 Million+'
+        WHEN '50 Million+'         THEN '$50 Million+'
+        WHEN '100 Million+'        THEN '$100 Million+'
+        WHEN 'Under $100k'         THEN 'Under $100k'
+        WHEN 'No Business Revenue' THEN 'No Business Revenue'
+        WHEN 'To Be Determined'    THEN NULL
+        WHEN '8'                   THEN NULL
+        ELSE COALESCE(habr.annual_business_revenue, c.abr)
+    END                                                         AS [Annual Business Revenue],
     -- Col 34: Vertical (DWH primary, tenxhub fallback — clean names RevOps expects)
     COALESCE(dc.vertical, c.vertical)                           AS [Vertical],
 
