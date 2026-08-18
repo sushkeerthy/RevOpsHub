@@ -93,54 +93,50 @@ customers AS (
     FROM [tenxhub].[ticket-manager].[customers] c
 ),
 
--- dim_customer: DWH only (simpler path)
+-- dim_customer: Vertical from DWH (clean names RevOps expects)
 dim_customer AS (
     SELECT
         dc.CVCustomerID
             COLLATE Latin1_General_100_BIN2_UTF8  AS cv_customer_id,
-        dc.VerticalName                           AS vertical,
-        dc.AnnualBusinessRevenueName              AS annual_business_revenue
+        dc.VerticalName                           AS vertical
     FROM [DWH].[dbo].[DimCustomer] dc
     WHERE dc.CVCustomerID IS NOT NULL
 ),
 
--- COMMENTED OUT: HubSpot (business owner contact) first, DWH fallback
--- Coverage: HubSpot+DWH = 89.1% Vertical, 90.8% ABR vs DWH-only = 87.6%, 88.9%
+-- hubspot_abr: ABR from HubSpot contact level (business owner)
+-- Per Yash: use contact-level ABR, not company-level, because entrepreneurs
+-- with multiple companies may transact under a company that doesn't reflect their true size
 -- Chain: DimCustomer → silver_Companies → silver_ContactCompanyAssoc
 --        → silver_Contacts WHERE BusinessOwner = 1
--- dim_customer AS (
---     SELECT
---         dc.CVCustomerID
---             COLLATE Latin1_General_100_BIN2_UTF8                          AS cv_customer_id,
---         COALESCE(
---             NULLIF(sc.CompanyVertical COLLATE Latin1_General_100_BIN2_UTF8, ''),
---             dc.VerticalName
---         )                                                                 AS vertical,
---         COALESCE(
---             NULLIF(sc.AnnualBusinessRevenue COLLATE Latin1_General_100_BIN2_UTF8, ''),
---             dc.AnnualBusinessRevenueName
---         )                                                                 AS annual_business_revenue
---     FROM [DWH].[dbo].[DimCustomer] dc
---     LEFT JOIN [Hubspot].[dbo].[silver_Companies] hc
---         ON dc.CVCustomerID COLLATE Latin1_General_100_BIN2_UTF8
---          = hc.CVCustomerID COLLATE Latin1_General_100_BIN2_UTF8
---     LEFT JOIN (
---         SELECT
---             ca.CompanyID,
---             sc.CompanyVertical   COLLATE Latin1_General_100_BIN2_UTF8    AS CompanyVertical,
---             sc.AnnualBusinessRevenue COLLATE Latin1_General_100_BIN2_UTF8 AS AnnualBusinessRevenue,
---             ROW_NUMBER() OVER (
---                 PARTITION BY ca.CompanyID
---                 ORDER BY sc.UpdatedAtUTC DESC
---             ) AS rn
---         FROM [Hubspot].[dbo].[silver_ContactCompanyAssoc] ca
---         JOIN [Hubspot].[dbo].[silver_Contacts] sc
---             ON ca.ContactID = sc.ContactID
---         WHERE sc.BusinessOwner = 1
---           AND (sc.CompanyVertical IS NOT NULL OR sc.AnnualBusinessRevenue IS NOT NULL)
---     ) sc ON hc.CompanyID = sc.CompanyID AND sc.rn = 1
---     WHERE dc.CVCustomerID IS NOT NULL
--- ),
+-- Falls back to DWH AnnualBusinessRevenueName if HubSpot has no data
+hubspot_abr AS (
+    SELECT
+        dc.CVCustomerID
+            COLLATE Latin1_General_100_BIN2_UTF8                          AS cv_customer_id,
+        COALESCE(
+            NULLIF(sc.AnnualBusinessRevenue COLLATE Latin1_General_100_BIN2_UTF8, ''),
+            dc.AnnualBusinessRevenueName
+        )                                                                 AS annual_business_revenue
+    FROM [DWH].[dbo].[DimCustomer] dc
+    LEFT JOIN [Hubspot].[dbo].[silver_Companies] hc
+        ON dc.CVCustomerID COLLATE Latin1_General_100_BIN2_UTF8
+         = hc.CVCustomerID COLLATE Latin1_General_100_BIN2_UTF8
+    LEFT JOIN (
+        SELECT
+            ca.CompanyID,
+            sc.AnnualBusinessRevenue COLLATE Latin1_General_100_BIN2_UTF8 AS AnnualBusinessRevenue,
+            ROW_NUMBER() OVER (
+                PARTITION BY ca.CompanyID
+                ORDER BY sc.UpdatedAtUTC DESC
+            ) AS rn
+        FROM [Hubspot].[dbo].[silver_ContactCompanyAssoc] ca
+        JOIN [Hubspot].[dbo].[silver_Contacts] sc
+            ON ca.ContactID = sc.ContactID
+        WHERE sc.BusinessOwner = 1
+          AND sc.AnnualBusinessRevenue IS NOT NULL
+    ) sc ON hc.CompanyID = sc.CompanyID AND sc.rn = 1
+    WHERE dc.CVCustomerID IS NOT NULL
+),
 
 -- ============================================================
 -- RYB PURCHASES (via DimCustomer → NetSuite)
@@ -554,8 +550,9 @@ SELECT
     -- Col 32: HubSpot Contact ID
     COALESCE(hp.ContactID, he.ContactID)                        AS [Hubspot Contact ID],
 
-    -- Col 33-34: ABR & Vertical (DWH primary, tenxhub fallback)
-    COALESCE(dc.annual_business_revenue, c.abr)                 AS [Annual Business Revenue],
+    -- Col 33: ABR (HubSpot contact-level primary, DWH fallback via hubspot_abr, tenxhub last resort)
+    COALESCE(habr.annual_business_revenue, c.abr)               AS [Annual Business Revenue],
+    -- Col 34: Vertical (DWH primary, tenxhub fallback — clean names RevOps expects)
     COALESCE(dc.vertical, c.vertical)                           AS [Vertical],
 
     -- Col 35: Elite Status (tenxhub customers.status: 3=E125, 4=E250)
@@ -591,6 +588,10 @@ LEFT JOIN customers c
 LEFT JOIN dim_customer dc
     ON c.cv_customer_id COLLATE Latin1_General_100_BIN2_UTF8
      = dc.cv_customer_id
+
+LEFT JOIN hubspot_abr habr
+    ON c.cv_customer_id COLLATE Latin1_General_100_BIN2_UTF8
+     = habr.cv_customer_id
 
 LEFT JOIN ryb_purchases ryb
     ON c.cv_customer_id COLLATE Latin1_General_100_BIN2_UTF8
