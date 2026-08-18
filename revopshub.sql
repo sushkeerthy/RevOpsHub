@@ -1,4 +1,5 @@
--- CREATE OR ALTER VIEW [DWH].[vw_revops_appscript] AS
+-- RevOps AppScript Pipeline — Standalone Query
+-- Cardone Ventures | Team Neo | April 2026
 
 WITH
 
@@ -66,9 +67,7 @@ sessions AS (
             ON ats.event_session_code COLLATE Latin1_General_100_BIN2_UTF8
              = es.CVEventSessionID    COLLATE Latin1_General_100_BIN2_UTF8
         WHERE at.attendee_id IN (
-            SELECT attendee_id FROM [tenxhub].[ticket-manager].[tickets]
-            WHERE product_name LIKE '%Elite Edge%'
-              AND LOWER(status) IN ('scheduled', 'attended', 'no show', 'assigned', 'reserved')
+            SELECT attendee_id FROM tickets
         )
     ) x
     WHERE room_type IS NOT NULL
@@ -137,9 +136,8 @@ refunds AS (
     FROM [tenxhub].[ticket-manager].[transactions] tr
     WHERE tr.refund_amount > 0
       AND tr.sales_order_id IN (
-          SELECT sales_order_id FROM [tenxhub].[ticket-manager].[tickets]
-          WHERE product_name LIKE '%Elite Edge%'
-            AND LOWER(status) IN ('scheduled', 'attended', 'no show', 'assigned', 'reserved')
+          SELECT sales_order_id FROM tickets
+          WHERE sales_order_id IS NOT NULL
       )
     GROUP BY tr.sales_order_id
 ),
@@ -151,14 +149,12 @@ refunds AS (
 ticket_notes AS (
     SELECT
         n.ticket_id,
-        STRING_AGG(n.note, CHAR(10)) AS notes
+        STRING_AGG(n.note, ' | ') AS notes
     FROM [tenxhub].[ticket-manager].[notes] n
     WHERE n.note NOT LIKE '%Created from POS%'
       AND n.note NOT LIKE '%Created from Fabric%'
       AND n.ticket_id IN (
-          SELECT ticket_id FROM [tenxhub].[ticket-manager].[tickets]
-          WHERE product_name LIKE '%Elite Edge%'
-            AND LOWER(status) IN ('scheduled', 'attended', 'no show', 'assigned', 'reserved')
+          SELECT ticket_id FROM tickets
       )
     GROUP BY n.ticket_id
 ),
@@ -184,10 +180,8 @@ netsuite AS (
       AND nt.TransactionLineID != 0
       AND nt.TransactionDisplayName COLLATE Latin1_General_100_BIN2_UTF8 IN (
           SELECT ('Sales Order #' + sales_order_id) COLLATE Latin1_General_100_BIN2_UTF8
-          FROM [tenxhub].[ticket-manager].[tickets]
-          WHERE product_name LIKE '%Elite Edge%'
-            AND LOWER(status) IN ('scheduled', 'attended', 'no show', 'assigned', 'reserved')
-            AND sales_order_id IS NOT NULL
+          FROM tickets
+          WHERE sales_order_id IS NOT NULL
       )
     GROUP BY nt.TransactionDisplayName
 ),
@@ -274,48 +268,27 @@ confirmed_by AS (
         WHERE h.action = 'Confirmation status updated'
           AND h.changed_by NOT IN ('System', 'bulk-import')
           AND h.ticket_id IN (
-              SELECT ticket_id FROM [tenxhub].[ticket-manager].[tickets]
-              WHERE product_name LIKE '%Elite Edge%'
-                AND LOWER(status) IN ('scheduled', 'attended', 'no show', 'assigned', 'reserved')
+              SELECT ticket_id FROM tickets
           )
     ) x
     WHERE rn = 1
 ),
 
 -- ============================================================
--- SOURCE OF PURCHASE (POS vs Concierge — kept for backward compat)
--- ============================================================
-
-source_of_purchase AS (
-    SELECT
-        t.ticket_id,
-        CASE
-            WHEN h.action = 'Event assigned/unassigned'
-             AND h.old_value IS NOT NULL AND h.old_value != ''
-             AND h.new_value IS NOT NULL AND h.new_value != ''
-            THEN 'Concierge'
-            ELSE 'POS'
-        END AS source_of_purchase
-    FROM [tenxhub].[ticket-manager].[tickets] t
-    LEFT JOIN (
-        SELECT
-            ticket_id,
-            action,
-            old_value,
-            new_value,
-            ROW_NUMBER() OVER (PARTITION BY ticket_id ORDER BY changed_at DESC) AS rn
-        FROM [tenxhub].[ticket-manager].[history]
-        WHERE action = 'Event assigned/unassigned'
-    ) h ON t.ticket_id = h.ticket_id AND h.rn = 1
-    WHERE t.product_name LIKE '%Elite Edge%'
-      AND LOWER(t.status) IN ('scheduled', 'attended', 'no show', 'assigned', 'reserved')
-),
-
--- ============================================================
--- SEAT SOURCE — NEW COLUMN
--- Primary: POS original event date comparison
--- Fallback: tenxhub history table
--- Categories: Sales, Rescheduled, Undecided, Comp
+-- SOURCE OF PURCHASE + SEAT ATTRIBUTION
+-- POS date comparison drives Source of Purchase
+-- Source of Purchase drives Seat Attribution
+--
+-- Source of Purchase logic:
+--   POS path: original event = current event → POS, different → Concierge
+--   Fallback: history reschedule or human-touched → Concierge, else → POS
+--
+-- Seat Attribution logic (AppScript rule: POS = always Sales):
+--   POS → Sales (always, no exceptions)
+--   Concierge + reschedule history + is_comped = 1 → Rescheduled + Comp
+--   Concierge + reschedule history + is_comped = 0 → Rescheduled
+--   Concierge + no reschedule + is_comped = 1 → Comp
+--   Concierge + everything else → Undecided
 -- ============================================================
 
 -- Step 1: Get original purchased event date from POS
@@ -324,7 +297,7 @@ pos_original_event AS (
     SELECT
         t.ticket_id,
         pos_evt.StartDate AS original_event_date
-    FROM [tenxhub].[ticket-manager].[tickets] t
+    FROM tickets t
     INNER JOIN (
         SELECT DISTINCT
             TransactionID,
@@ -345,12 +318,10 @@ pos_original_event AS (
     INNER JOIN [POS].[dbo].[silver_Events] pos_evt
         ON pos_evt.EventID = bose.selected_event_id
             COLLATE Latin1_General_100_BIN2_UTF8
-    WHERE t.product_name LIKE '%Elite Edge%'
-      AND LOWER(t.status) IN ('scheduled', 'attended', 'no show', 'assigned', 'reserved')
-      AND t.sales_order_id IS NOT NULL
+    WHERE t.sales_order_id IS NOT NULL
 ),
 
--- Step 2: Deduplicate (one row per ticket)
+-- Step 2: Deduplicate POS results (one row per ticket)
 pos_original_event_dedup AS (
     SELECT
         ticket_id,
@@ -359,64 +330,69 @@ pos_original_event_dedup AS (
     GROUP BY ticket_id
 ),
 
--- Step 3: Fallback — history table for tickets without POS match
-history_fallback AS (
-    SELECT
-        ticket_id,
-        action,
-        old_value,
-        new_value
-    FROM (
-        SELECT
-            ticket_id,
-            action,
-            old_value,
-            new_value,
-            ROW_NUMBER() OVER (PARTITION BY ticket_id ORDER BY changed_at DESC) AS rn
-        FROM [tenxhub].[ticket-manager].[history]
-        WHERE action = 'Event assigned/unassigned'
-    ) h
-    WHERE h.rn = 1
+-- Step 3: History — full reschedule (both old+new values, any actor)
+history_rescheduled AS (
+    SELECT DISTINCT ticket_id
+    FROM [tenxhub].[ticket-manager].[history]
+    WHERE action = 'Event assigned/unassigned'
+      AND old_value IS NOT NULL AND old_value != ''
+      AND new_value IS NOT NULL AND new_value != ''
 ),
 
--- Step 4: Final Seat Source classification
--- Sales = same event as purchased
--- Rescheduled = different event + Concierge actively moved (history confirms)
--- Undecided = different event + NO active move (passively pushed forward)
--- Comp = no POS match, no history, is_comped = 1
-seat_source AS (
+-- Step 4: History — human-touched Concierge (fallback for no-POS tickets)
+-- Excludes system actors: bulk-import, service, System, POS, FabricImport
+history_concierge AS (
+    SELECT DISTINCT ticket_id
+    FROM [tenxhub].[ticket-manager].[history]
+    WHERE action = 'Event assigned/unassigned'
+      AND changed_by NOT IN ('bulk-import', 'service', 'System', 'POS', 'FabricImport')
+      AND changed_by IS NOT NULL
+),
+
+-- Step 5: Source of Purchase (POS date comparison primary, history fallback)
+source_of_purchase AS (
     SELECT
         t.ticket_id,
         CASE
-            -- POS path available
+            -- POS path available: compare dates
             WHEN poe.original_event_date IS NOT NULL THEN
                 CASE
-                    -- Same event as purchased → Sales
-                    WHEN CAST(t.event_date AS DATE) = poe.original_event_date THEN 'Sales'
-                    -- Different event + Concierge moved them → Rescheduled
-                    WHEN hf.action = 'Event assigned/unassigned'
-                     AND hf.old_value IS NOT NULL AND hf.old_value != ''
-                     AND hf.new_value IS NOT NULL AND hf.new_value != ''
-                    THEN 'Rescheduled'
-                    -- Different event + no active move → Undecided (passively pushed)
-                    ELSE 'Undecided'
+                    WHEN CAST(t.event_date AS DATE) = poe.original_event_date THEN 'POS'
+                    ELSE 'Concierge'
                 END
-            -- No POS match: fallback to history only
-            WHEN hf.action = 'Event assigned/unassigned'
-             AND hf.old_value IS NOT NULL AND hf.old_value != ''
-             AND hf.new_value IS NOT NULL AND hf.new_value != ''
-            THEN 'Rescheduled'
-            WHEN hf.action IS NOT NULL THEN 'Undecided'
-            -- No POS, no history, comped
-            WHEN t.is_comped = 1 THEN 'Comp'
-            -- Default
-            ELSE 'Sales'
-        END AS seat_source
-    FROM [tenxhub].[ticket-manager].[tickets] t
+            -- Fallback: no POS match
+            WHEN hr.ticket_id IS NOT NULL THEN 'Concierge'
+            WHEN hc.ticket_id IS NOT NULL THEN 'Concierge'
+            ELSE 'POS'
+        END AS source_of_purchase
+    FROM tickets t
     LEFT JOIN pos_original_event_dedup poe ON t.ticket_id = poe.ticket_id
-    LEFT JOIN history_fallback hf          ON t.ticket_id = hf.ticket_id
-    WHERE t.product_name LIKE '%Elite Edge%'
-      AND LOWER(t.status) IN ('scheduled', 'attended', 'no show', 'assigned', 'reserved')
+    LEFT JOIN history_rescheduled hr       ON t.ticket_id = hr.ticket_id
+    LEFT JOIN history_concierge hc         ON t.ticket_id = hc.ticket_id
+),
+
+-- Step 6: Seat Attribution (driven by Source of Purchase)
+-- POS → Sales (always). Concierge → Rescheduled / Rescheduled + Comp / Undecided / Comp
+seat_attribution AS (
+    SELECT
+        t.ticket_id,
+        CASE
+            -- POS = always Sales
+            WHEN sop.source_of_purchase = 'POS' THEN 'Sales'
+            -- Concierge + full reschedule history + comped = Rescheduled + Comp
+            WHEN sop.source_of_purchase = 'Concierge' AND hr.ticket_id IS NOT NULL AND COALESCE(t.is_comped, 0) = 1 THEN 'Rescheduled + Comp'
+            -- Concierge + full reschedule history + not comped = Rescheduled
+            WHEN sop.source_of_purchase = 'Concierge' AND hr.ticket_id IS NOT NULL AND COALESCE(t.is_comped, 0) = 0 THEN 'Rescheduled'
+            -- Concierge + no reschedule + comped = Comp
+            WHEN sop.source_of_purchase = 'Concierge' AND COALESCE(t.is_comped, 0) = 1 AND hr.ticket_id IS NULL THEN 'Comp'
+            -- Concierge + everything else = Undecided
+            WHEN sop.source_of_purchase = 'Concierge' THEN 'Undecided'
+            -- Safety default
+            ELSE 'Sales'
+        END AS seat_attribution
+    FROM tickets t
+    INNER JOIN source_of_purchase sop ON t.ticket_id = sop.ticket_id
+    LEFT JOIN history_rescheduled hr  ON t.ticket_id = hr.ticket_id
 )
 
 -- ============================================================
@@ -429,7 +405,10 @@ SELECT
         + FORMAT(DATEADD(DAY, 2, t.event_date), 'dd') + ' '
         + FORMAT(t.event_date, 'yyyy')                          AS [Tab Name],
 
-    -- Col 2: Product (ticket product name — Ticket Type has the tier)
+    -- Col 2: Seat Attribution (NEW — Sales, Rescheduled, Rescheduled + Comp, Undecided, Comp)
+    sa.seat_attribution                                          AS [Seat Attribution],
+
+    -- Col 3: Product (ticket product name)
     t.product_name                                              AS [Product],
 
     -- Col 3: Ticket Type
@@ -485,18 +464,21 @@ SELECT
     -- Col 25: Price
     t.ticket_price                                              AS [Price],
 
-    -- Col 26-27: Sales Reps
+    -- Col 26-27: Sales Reps (email + name)
     e1.Email                                                    AS [Sales Person 1],
+    nsr.SalesRepName                                            AS [Sales Person 1 Name],
     e2.Email                                                    AS [Sales Person 2],
+    nsr.SalesRep2Name                                           AS [Sales Person 2 Name],
 
-    -- Col 28: Source of Purchase (legacy: POS vs Concierge)
+    -- Col 28: Source of Purchase (POS vs Concierge)
     sop.source_of_purchase                                      AS [Source of Purchase],
 
-    -- Col 29: Seat Source (NEW — Sales, Rescheduled, Undecided, Comp)
-    ss.seat_source                                              AS [Seat Source],
-
-    -- Col 30: Is Comped (separate boolean flag)
-    t.is_comped                                                 AS [Is Comped],
+    -- Col 29: Comp Type (replaces Is Comped — distinguishes comp with/without sales order)
+    CASE
+        WHEN COALESCE(t.is_comped, 0) = 1 AND t.sales_order_id IS NOT NULL THEN 'Comp - Sales Order'
+        WHEN COALESCE(t.is_comped, 0) = 1 AND t.sales_order_id IS NULL     THEN 'Comp - No Sales Order'
+        ELSE NULL
+    END                                                         AS [Comp Type],
 
     -- Col 31: DATE Selection (DNT)
     t.event_date                                                AS [DATE Selection (DNT)],
@@ -568,5 +550,10 @@ LEFT JOIN confirmed_by cb
 LEFT JOIN source_of_purchase sop
     ON t.ticket_id = sop.ticket_id
 
-LEFT JOIN seat_source ss
-    ON t.ticket_id = ss.ticket_id;
+LEFT JOIN seat_attribution sa
+    ON t.ticket_id = sa.ticket_id
+
+ORDER BY
+    t.event_date,
+    c.company_name,
+    a.attendee_name;
