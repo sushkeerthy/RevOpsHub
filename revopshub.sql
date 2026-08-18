@@ -283,19 +283,39 @@ confirmed_by AS (
 ),
 
 -- ============================================================
--- SOURCE OF PURCHASE + SEAT SOURCE
--- POS date comparison drives Source of Purchase
--- Source of Purchase drives Seat Source
---
--- Source of Purchase logic:
---   POS path: original event = current event → POS, different → Concierge
---   Fallback: history reschedule or human-touched → Concierge, else → POS
---
--- Seat Source logic (AppScript rule: POS = always Sales):
---   POS → Sales (always, no exceptions)
---   Concierge + has both old+new in history → Rescheduled
---   Concierge + is_comped = 1 + no reschedule history → Comp
---   Concierge + everything else → Undecided
+-- SOURCE OF PURCHASE (POS vs Concierge — kept for backward compat)
+-- ============================================================
+
+source_of_purchase AS (
+    SELECT
+        t.ticket_id,
+        CASE
+            WHEN h.action = 'Event assigned/unassigned'
+             AND h.old_value IS NOT NULL AND h.old_value != ''
+             AND h.new_value IS NOT NULL AND h.new_value != ''
+            THEN 'Concierge'
+            ELSE 'POS'
+        END AS source_of_purchase
+    FROM [tenxhub].[ticket-manager].[tickets] t
+    LEFT JOIN (
+        SELECT
+            ticket_id,
+            action,
+            old_value,
+            new_value,
+            ROW_NUMBER() OVER (PARTITION BY ticket_id ORDER BY changed_at DESC) AS rn
+        FROM [tenxhub].[ticket-manager].[history]
+        WHERE action = 'Event assigned/unassigned'
+    ) h ON t.ticket_id = h.ticket_id AND h.rn = 1
+    WHERE t.product_name LIKE '%Elite Edge%'
+      AND LOWER(t.status) IN ('scheduled', 'attended', 'no show', 'assigned', 'reserved')
+),
+
+-- ============================================================
+-- SEAT SOURCE — NEW COLUMN
+-- Primary: POS original event date comparison
+-- Fallback: tenxhub history table
+-- Categories: Sales, Rescheduled, Undecided, Comp
 -- ============================================================
 
 -- Step 1: Get original purchased event date from POS
@@ -330,7 +350,7 @@ pos_original_event AS (
       AND t.sales_order_id IS NOT NULL
 ),
 
--- Step 2: Deduplicate POS results (one row per ticket)
+-- Step 2: Deduplicate (one row per ticket)
 pos_original_event_dedup AS (
     SELECT
         ticket_id,
@@ -339,69 +359,62 @@ pos_original_event_dedup AS (
     GROUP BY ticket_id
 ),
 
--- Step 3: History — full reschedule (both old+new values, any actor)
-history_rescheduled AS (
-    SELECT DISTINCT ticket_id
-    FROM [tenxhub].[ticket-manager].[history]
-    WHERE action = 'Event assigned/unassigned'
-      AND old_value IS NOT NULL AND old_value != ''
-      AND new_value IS NOT NULL AND new_value != ''
-),
-
--- Step 4: History — human-touched Concierge (fallback for no-POS tickets)
--- Excludes system actors: bulk-import, service, System, POS, FabricImport
-history_concierge AS (
-    SELECT DISTINCT ticket_id
-    FROM [tenxhub].[ticket-manager].[history]
-    WHERE action = 'Event assigned/unassigned'
-      AND changed_by NOT IN ('bulk-import', 'service', 'System', 'POS', 'FabricImport')
-      AND changed_by IS NOT NULL
-),
-
--- Step 5: Source of Purchase (POS date comparison primary, history fallback)
-source_of_purchase AS (
+-- Step 3: Fallback — history table for tickets without POS match
+history_fallback AS (
     SELECT
-        t.ticket_id,
-        CASE
-            -- POS path available: compare dates
-            WHEN poe.original_event_date IS NOT NULL THEN
-                CASE
-                    WHEN CAST(t.event_date AS DATE) = poe.original_event_date THEN 'POS'
-                    ELSE 'Concierge'
-                END
-            -- Fallback: no POS match
-            WHEN hr.ticket_id IS NOT NULL THEN 'Concierge'
-            WHEN hc.ticket_id IS NOT NULL THEN 'Concierge'
-            ELSE 'POS'
-        END AS source_of_purchase
-    FROM [tenxhub].[ticket-manager].[tickets] t
-    LEFT JOIN pos_original_event_dedup poe ON t.ticket_id = poe.ticket_id
-    LEFT JOIN history_rescheduled hr       ON t.ticket_id = hr.ticket_id
-    LEFT JOIN history_concierge hc         ON t.ticket_id = hc.ticket_id
-    WHERE t.product_name LIKE '%Elite Edge%'
-      AND LOWER(t.status) IN ('scheduled', 'attended', 'no show', 'assigned', 'reserved')
+        ticket_id,
+        action,
+        old_value,
+        new_value
+    FROM (
+        SELECT
+            ticket_id,
+            action,
+            old_value,
+            new_value,
+            ROW_NUMBER() OVER (PARTITION BY ticket_id ORDER BY changed_at DESC) AS rn
+        FROM [tenxhub].[ticket-manager].[history]
+        WHERE action = 'Event assigned/unassigned'
+    ) h
+    WHERE h.rn = 1
 ),
 
--- Step 6: Seat Source (driven by Source of Purchase)
--- POS → Sales (always). Concierge → Rescheduled / Undecided / Comp
+-- Step 4: Final Seat Source classification
+-- Sales = same event as purchased
+-- Rescheduled = different event + Concierge actively moved (history confirms)
+-- Undecided = different event + NO active move (passively pushed forward)
+-- Comp = no POS match, no history, is_comped = 1
 seat_source AS (
     SELECT
         t.ticket_id,
         CASE
-            -- POS = always Sales
-            WHEN sop.source_of_purchase = 'POS' THEN 'Sales'
-            -- Concierge + full reschedule history = Rescheduled
-            WHEN sop.source_of_purchase = 'Concierge' AND hr.ticket_id IS NOT NULL THEN 'Rescheduled'
-            -- Concierge + is_comped + no reschedule = Comp
-            WHEN sop.source_of_purchase = 'Concierge' AND t.is_comped = 1 AND hr.ticket_id IS NULL THEN 'Comp'
-            -- Concierge + everything else = Undecided
-            WHEN sop.source_of_purchase = 'Concierge' THEN 'Undecided'
-            -- Safety default
+            -- POS path available
+            WHEN poe.original_event_date IS NOT NULL THEN
+                CASE
+                    -- Same event as purchased → Sales
+                    WHEN CAST(t.event_date AS DATE) = poe.original_event_date THEN 'Sales'
+                    -- Different event + Concierge moved them → Rescheduled
+                    WHEN hf.action = 'Event assigned/unassigned'
+                     AND hf.old_value IS NOT NULL AND hf.old_value != ''
+                     AND hf.new_value IS NOT NULL AND hf.new_value != ''
+                    THEN 'Rescheduled'
+                    -- Different event + no active move → Undecided (passively pushed)
+                    ELSE 'Undecided'
+                END
+            -- No POS match: fallback to history only
+            WHEN hf.action = 'Event assigned/unassigned'
+             AND hf.old_value IS NOT NULL AND hf.old_value != ''
+             AND hf.new_value IS NOT NULL AND hf.new_value != ''
+            THEN 'Rescheduled'
+            WHEN hf.action IS NOT NULL THEN 'Undecided'
+            -- No POS, no history, comped
+            WHEN t.is_comped = 1 THEN 'Comp'
+            -- Default
             ELSE 'Sales'
         END AS seat_source
     FROM [tenxhub].[ticket-manager].[tickets] t
-    INNER JOIN source_of_purchase sop ON t.ticket_id = sop.ticket_id
-    LEFT JOIN history_rescheduled hr  ON t.ticket_id = hr.ticket_id
+    LEFT JOIN pos_original_event_dedup poe ON t.ticket_id = poe.ticket_id
+    LEFT JOIN history_fallback hf          ON t.ticket_id = hf.ticket_id
     WHERE t.product_name LIKE '%Elite Edge%'
       AND LOWER(t.status) IN ('scheduled', 'attended', 'no show', 'assigned', 'reserved')
 )
