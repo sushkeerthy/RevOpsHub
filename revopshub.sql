@@ -1,5 +1,11 @@
--- RevOps AppScript Pipeline — Standalone Query
+-- RevOps AppScript Pipeline — View Definition
 -- Cardone Ventures | Team Neo | April 2026
+-- v6: Sessions fix (ticket_id + event scoping), Seat Attribution (true comp first, 
+--     Rescheduled+Undecided), Source of Purchase (undecided signals, removed human-touched),
+--     ABR split (HubSpot contact for ABR, DWH for Vertical), ABR standardization,
+--     Elite Status, RYB, Power BI columns
+
+CREATE OR ALTER VIEW [dbo].[vw_revopshub] AS
 
 WITH
 
@@ -28,7 +34,7 @@ tickets AS (
         t.purchaser_email,
         t.is_comped,
         t.undecided_timestamp
-    FROM [tenxhub].[ticket-manager].[tickets] t
+    FROM [dbo].[tenxhub_tickets] t
     WHERE t.product_name LIKE '%Elite Edge%'
       AND LOWER(t.status) IN ('scheduled', 'attended', 'no show', 'assigned', 'reserved')
 ),
@@ -41,7 +47,7 @@ attendees AS (
         a.attendee_email,
         a.attendee_phone,
         a.dietary_restrictions
-    FROM [tenxhub].[ticket-manager].[attendees] a
+    FROM [dbo].[tenxhub_attendees] a
 ),
 
 -- ============================================================
@@ -63,12 +69,12 @@ sessions AS (
                 WHEN es.SessionName LIKE '%10X360 Implementation%' THEN '10X360 Implementation'
                 ELSE NULL
             END AS room_type
-        FROM [tenxhub].[ticket-manager].[attendee_ticket_sessions] ats
-        JOIN [tenxhub].[ticket-manager].[attendee_tickets] att
+        FROM [dbo].[tenxhub_attendee_ticket_sessions] ats
+        JOIN [dbo].[tenxhub_attendee_tickets] att
             ON ats.attendee_ticket_id = att.attendee_ticket_id
-        LEFT JOIN [Profisee].[dbo].[silver_EventSession] es
+        LEFT JOIN [dbo].[Profisee_EventSession] es
             ON ats.event_session_code COLLATE Latin1_General_100_BIN2_UTF8
-             = es.CVEventSessionID    COLLATE Latin1_General_100_BIN2_UTF8
+             = es.EventSessionCode    COLLATE Latin1_General_100_BIN2_UTF8
         JOIN tickets t
             ON att.ticket_id = t.ticket_id
         WHERE es.Event COLLATE Latin1_General_100_BIN2_UTF8
@@ -90,7 +96,7 @@ customers AS (
         c.abr,
         c.vertical,
         c.status          AS customer_status
-    FROM [tenxhub].[ticket-manager].[customers] c
+    FROM [dbo].[tenxhub_customers] c
 ),
 
 -- dim_customer: Vertical from DWH (clean names RevOps expects)
@@ -99,7 +105,7 @@ dim_customer AS (
         dc.CVCustomerID
             COLLATE Latin1_General_100_BIN2_UTF8  AS cv_customer_id,
         dc.VerticalName                           AS vertical
-    FROM [DWH].[dbo].[DimCustomer] dc
+    FROM [dbo].[DimCustomer] dc
     WHERE dc.CVCustomerID IS NOT NULL
 ),
 
@@ -117,8 +123,8 @@ hubspot_abr AS (
             NULLIF(sc.AnnualBusinessRevenue COLLATE Latin1_General_100_BIN2_UTF8, ''),
             dc.AnnualBusinessRevenueName
         )                                                                 AS annual_business_revenue
-    FROM [DWH].[dbo].[DimCustomer] dc
-    LEFT JOIN [Hubspot].[dbo].[silver_Companies] hc
+    FROM [dbo].[DimCustomer] dc
+    LEFT JOIN [dbo].[Hubspot_Companies] hc
         ON dc.CVCustomerID COLLATE Latin1_General_100_BIN2_UTF8
          = hc.CVCustomerID COLLATE Latin1_General_100_BIN2_UTF8
     LEFT JOIN (
@@ -129,8 +135,8 @@ hubspot_abr AS (
                 PARTITION BY ca.CompanyID
                 ORDER BY sc.UpdatedAtUTC DESC
             ) AS rn
-        FROM [Hubspot].[dbo].[silver_ContactCompanyAssoc] ca
-        JOIN [Hubspot].[dbo].[silver_Contacts] sc
+        FROM [dbo].[Hubspot_ContactCompanyAssoc] ca
+        JOIN [dbo].[Hubspot_Contacts] sc
             ON ca.ContactID = sc.ContactID
         WHERE sc.BusinessOwner = 1
           AND sc.AnnualBusinessRevenue IS NOT NULL
@@ -158,8 +164,8 @@ ryb_purchases AS (
                 PARTITION BY dc.CVCustomerID
                 ORDER BY txn.TransactionDate DESC
             ) AS rn
-        FROM [DWH].[dbo].[DimCustomer] dc
-        JOIN [NetSuite].[dbo].[silver_Transaction] txn
+        FROM [dbo].[DimCustomer] dc
+        JOIN [dbo].[NetSuite_Transaction] txn
             ON dc.NetSuiteID = txn.EntityID
         WHERE txn.ItemName LIKE '%RYB%'
           AND txn.SubsidiaryID = 11
@@ -177,7 +183,7 @@ refunds AS (
     SELECT
         tr.sales_order_id,
         'Yes - ' + STRING_AGG(tr.refund_reason, '; ') AS refund_info
-    FROM [tenxhub].[ticket-manager].[transactions] tr
+    FROM [dbo].[tenxhub_transactions] tr
     WHERE tr.refund_amount > 0
       AND tr.sales_order_id IN (
           SELECT sales_order_id FROM tickets
@@ -194,7 +200,7 @@ ticket_notes AS (
     SELECT
         n.ticket_id,
         STRING_AGG(n.note, ' | ') AS notes
-    FROM [tenxhub].[ticket-manager].[notes] n
+    FROM [dbo].[tenxhub_notes] n
     WHERE n.note NOT LIKE '%Created from POS%'
       AND n.note NOT LIKE '%Created from Fabric%'
       AND n.ticket_id IN (
@@ -219,7 +225,7 @@ netsuite AS (
         MAX(nt.SalesRep2Name)
             COLLATE Latin1_General_100_BIN2_UTF8          AS SalesRep2Name,
         MIN(nt.TransactionID)                             AS TransactionID
-    FROM [NetSuite].[dbo].[silver_Transaction] nt
+    FROM [dbo].[NetSuite_Transaction] nt
     WHERE nt.TransactionType    = 'Sales Order'
       AND nt.TransactionLineID != 0
       AND nt.TransactionDisplayName COLLATE Latin1_General_100_BIN2_UTF8 IN (
@@ -271,7 +277,7 @@ dim_employee AS (
     SELECT DISTINCT
         de.EmployeeName COLLATE Latin1_General_100_BIN2_UTF8 AS EmployeeName,
         de.Email        COLLATE Latin1_General_100_BIN2_UTF8 AS Email
-    FROM [DWH].[dbo].[DimEmployee] de
+    FROM [dbo].[DimEmployee] de
     WHERE de.Email IS NOT NULL
 ),
 
@@ -283,7 +289,7 @@ hubspot_person AS (
     SELECT
         hc.CVPersonID  COLLATE Latin1_General_100_BIN2_UTF8 AS CVPersonID,
         hc.ContactID
-    FROM [HubSpot].[dbo].[silver_Contacts] hc
+    FROM [dbo].[Hubspot_Contacts] hc
     WHERE hc.CVPersonID IS NOT NULL
 ),
 
@@ -291,7 +297,7 @@ hubspot_email AS (
     SELECT
         LOWER(hc.Email) COLLATE Latin1_General_100_BIN2_UTF8 AS Email,
         hc.ContactID
-    FROM [HubSpot].[dbo].[silver_Contacts] hc
+    FROM [dbo].[Hubspot_Contacts] hc
     WHERE hc.Email IS NOT NULL
 ),
 
@@ -308,7 +314,7 @@ confirmed_by AS (
             h.ticket_id,
             h.changed_by,
             ROW_NUMBER() OVER (PARTITION BY h.ticket_id ORDER BY h.changed_at DESC) AS rn
-        FROM [tenxhub].[ticket-manager].[history] h
+        FROM [dbo].[tenxhub_history] h
         WHERE h.action = 'Confirmation status updated'
           AND h.changed_by NOT IN ('System', 'bulk-import')
           AND h.ticket_id IN (
@@ -355,20 +361,20 @@ pos_original_event AS (
         SELECT DISTINCT
             TransactionID,
             TransactionDisplayName
-        FROM [NetSuite].[dbo].[silver_Transaction]
+        FROM [dbo].[NetSuite_Transaction]
         WHERE TransactionType = 'Sales Order'
           AND TransactionLineID = 0
     ) ns_link
         ON ns_link.TransactionDisplayName = CONCAT('Sales Order #', t.sales_order_id)
             COLLATE Latin1_General_100_BIN2_UTF8
-    INNER JOIN [POS].[dbo].[bronze_OrdersFULL] bof
+    INNER JOIN [dbo].[POS_OrdersFULL] bof
         ON bof.sales_order_ids COLLATE Latin1_General_100_BIN2_UTF8
          = CAST(ns_link.TransactionID AS VARCHAR(20)) COLLATE Latin1_General_100_BIN2_UTF8
-    INNER JOIN [POS].[dbo].[bronze_OrdersSelectedEventsFULL] bose
+    INNER JOIN [dbo].[POS_OrdersSelectedEventsFULL] bose
         ON bose.order_id = bof.order_id
             COLLATE Latin1_General_100_BIN2_UTF8
         AND bose.selected_event_name LIKE '%Elite Edge%'
-    INNER JOIN [POS].[dbo].[silver_Events] pos_evt
+    INNER JOIN [dbo].[POS_Events] pos_evt
         ON pos_evt.EventID = bose.selected_event_id
             COLLATE Latin1_General_100_BIN2_UTF8
     WHERE t.sales_order_id IS NOT NULL
@@ -386,7 +392,7 @@ pos_original_event_dedup AS (
 -- Step 3: History — full reschedule (both old+new values, any actor)
 history_rescheduled AS (
     SELECT DISTINCT ticket_id
-    FROM [tenxhub].[ticket-manager].[history]
+    FROM [dbo].[tenxhub_history]
     WHERE action = 'Event assigned/unassigned'
       AND old_value IS NOT NULL AND old_value != ''
       AND new_value IS NOT NULL AND new_value != ''
@@ -396,7 +402,7 @@ history_rescheduled AS (
 -- Direct evidence: action = 'Status changed to undecided' means ticket entered the pool
 history_was_undecided AS (
     SELECT DISTINCT ticket_id
-    FROM [tenxhub].[ticket-manager].[history]
+    FROM [dbo].[tenxhub_history]
     WHERE action = 'Status changed to undecided'
 ),
 
