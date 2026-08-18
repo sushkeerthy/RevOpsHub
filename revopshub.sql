@@ -594,7 +594,31 @@ SELECT
     NULL                                                        AS [Products Sold At the Event],
     nsr.is_10x360                                               AS [10X360],
     ryb.ItemName                                                AS [RYB],
-    NULL                                                        AS [TCV]
+    NULL                                                        AS [TCV],
+
+    -- ============================================================
+    -- POWER BI COLUMNS
+    -- Event/Purchase/Confirmation dimensions for matrices and charts
+    -- ============================================================
+
+    -- Event date dimensions
+    FORMAT(t.event_date, 'MMMM')                                AS [Event Month],
+    MONTH(t.event_date)                                         AS [Event Month Sort],
+    YEAR(t.event_date)                                          AS [Event Year],
+    'Q' + CAST(DATEPART(QUARTER, t.event_date) AS VARCHAR)      AS [Event Quarter],
+    DATEPART(QUARTER, t.event_date)                             AS [Event Quarter Sort],
+
+    -- Purchase date dimensions
+    FORMAT(nsr.date_of_purchase, 'MMMM')                        AS [Purchase Month],
+    MONTH(nsr.date_of_purchase)                                 AS [Purchase Month Sort],
+    YEAR(nsr.date_of_purchase)                                  AS [Purchase Year],
+    DAY(nsr.date_of_purchase)                                   AS [Purchase Day],
+
+    -- Confirmation date dimensions
+    FORMAT(t.confirmed_date, 'MMMM')                            AS [Confirmation Month],
+    MONTH(t.confirmed_date)                                     AS [Confirmation Month Sort],
+    YEAR(t.confirmed_date)                                      AS [Confirmation Year],
+    DAY(t.confirmed_date)                                       AS [Confirmation Day]
 
 FROM tickets t
 
@@ -654,9 +678,4 @@ LEFT JOIN source_of_purchase sop
     ON t.ticket_id = sop.ticket_id
 
 LEFT JOIN seat_attribution sa
-    ON t.ticket_id = sa.ticket_id
-
-ORDER BY
-    t.event_date,
-    c.company_name,
-    a.attendee_name;
+    ON t.ticket_id = sa.ticket_id;
