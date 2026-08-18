@@ -1,5 +1,5 @@
 -- RevOps AppScript Pipeline — Standalone Query
--- Cardone Ventures | Team Neo | April 21 2026
+-- Cardone Ventures | Team Neo | April 2026
 
 WITH
 
@@ -46,15 +46,17 @@ attendees AS (
 
 -- ============================================================
 -- ROOM ORIGINATION (session codes → ancillary event names)
+-- Scoped to current event: joins silver_EventSession.Event to tickets.event_id
+-- Uses ticket_id (not attendee_id) to avoid cross-ticket session leakage
 -- ============================================================
 
 sessions AS (
     SELECT
-        attendee_id,
+        x.ticket_id,
         STRING_AGG(room_type, ', ') AS room_origination
     FROM (
         SELECT DISTINCT
-            at.attendee_id,
+            att.ticket_id,
             CASE
                 WHEN es.SessionName LIKE '%Vertical Summit%'       THEN 'Vertical Summit'
                 WHEN es.SessionName LIKE '%Roofing Founders%'      THEN 'Roofing Founders Summit'
@@ -62,17 +64,18 @@ sessions AS (
                 ELSE NULL
             END AS room_type
         FROM [tenxhub].[ticket-manager].[attendee_ticket_sessions] ats
-        JOIN [tenxhub].[ticket-manager].[attendee_tickets] at
-            ON ats.attendee_ticket_id = at.attendee_ticket_id
+        JOIN [tenxhub].[ticket-manager].[attendee_tickets] att
+            ON ats.attendee_ticket_id = att.attendee_ticket_id
         LEFT JOIN [Profisee].[dbo].[silver_EventSession] es
             ON ats.event_session_code COLLATE Latin1_General_100_BIN2_UTF8
              = es.CVEventSessionID    COLLATE Latin1_General_100_BIN2_UTF8
-        WHERE at.attendee_id IN (
-            SELECT attendee_id FROM tickets
-        )
+        JOIN tickets t
+            ON att.ticket_id = t.ticket_id
+        WHERE es.Event COLLATE Latin1_General_100_BIN2_UTF8
+            = t.event_id COLLATE Latin1_General_100_BIN2_UTF8
     ) x
     WHERE room_type IS NOT NULL
-    GROUP BY attendee_id
+    GROUP BY x.ticket_id
 ),
 
 -- ============================================================
@@ -580,7 +583,7 @@ LEFT JOIN attendees a
     ON t.attendee_id = a.attendee_id
 
 LEFT JOIN sessions s
-    ON t.attendee_id = s.attendee_id
+    ON t.ticket_id = s.ticket_id
 
 LEFT JOIN customers c
     ON t.customer_id = c.customer_id
