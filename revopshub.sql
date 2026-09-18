@@ -33,6 +33,13 @@
 --   WITH block must appear BEFORE the first SELECT in a UNION ALL.
 --   Part A (materialized table) is the first SELECT after the CTE block.
 --   CTEs are in scope for all three parts of the UNION ALL.
+--
+-- [FIX] 10X360 freeze for past events (Sep 2026):
+--   [10X360] column in Parts B1 and B2 now gates on event date.
+--   For events that have already passed: 'Yes' only if First10X360PurchaseDate <= event_date.
+--   For upcoming events: live flag as before.
+--   Prevents confirmed-without-10X360 counts from dropping retroactively
+--   as businesses purchase 10X360 after the event closes.
 -- ============================================================
 
 WITH
@@ -698,7 +705,17 @@ SELECT
     NULL                                                        AS [Vertical Summit?],
     t.status                                                    AS [Status],
     NULL                                                        AS [Products Sold At the Event],
-    x360.is_10x360_flag                                         AS [10X360],
+    -- [FIX] Freeze 10X360 for past events: only 'Yes' if purchased on/before event date.
+    -- Future events continue to use the live flag from DimCustomer.
+    CASE
+        WHEN CAST(t.event_date AS DATE) < CAST(GETDATE() AS DATE)
+            THEN CASE
+                WHEN x360.first_10x360_purchase_date IS NOT NULL
+                 AND CAST(x360.first_10x360_purchase_date AS DATE) <= CAST(t.event_date AS DATE)
+                THEN 'Yes' ELSE NULL
+            END
+        ELSE x360.is_10x360_flag
+    END                                                         AS [10X360],
     x360.first_10x360_purchase_date                             AS [First 10X360 Purchase Date],
     ryb.ItemName                                                AS [RYB],
     NULL                                                        AS [TCV],
@@ -845,7 +862,17 @@ SELECT
     NULL                                                        AS [Vertical Summit?],
     tnsr.source_ticket_status                                   AS [Status],
     NULL                                                        AS [Products Sold At the Event],
-    x360_2.is_10x360_flag                                       AS [10X360],
+    -- [FIX] Freeze 10X360 for past events: only 'Yes' if purchased on/before event date.
+    -- Future events continue to use the live flag from DimCustomer.
+    CASE
+        WHEN CAST(tnsr.event_date AS DATE) < CAST(GETDATE() AS DATE)
+            THEN CASE
+                WHEN x360_2.first_10x360_purchase_date IS NOT NULL
+                 AND CAST(x360_2.first_10x360_purchase_date AS DATE) <= CAST(tnsr.event_date AS DATE)
+                THEN 'Yes' ELSE NULL
+            END
+        ELSE x360_2.is_10x360_flag
+    END                                                         AS [10X360],
     x360_2.first_10x360_purchase_date                           AS [First 10X360 Purchase Date],
     ryb2.ItemName                                               AS [RYB],
     NULL                                                        AS [TCV],
